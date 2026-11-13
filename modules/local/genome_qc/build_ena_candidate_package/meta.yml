@@ -1,0 +1,31 @@
+name: build_ena_candidate_package
+description: Build and locally validate a self-contained ENA genome-context mitogenome package
+keywords:
+  - ena
+  - mitogenome
+  - package
+input:
+  - sample_fa:
+      type: file
+      description: Single-record mitochondrial FASTA
+  - sample_tbl:
+      type: file
+      description: Processed feature table
+  - sample_gff:
+      type: file
+      description: Processed annotation GFF, packaged verbatim for collaborators
+  - embl_file:
+      type: file
+      description: Annotated EMBL flat file
+  - input_metadata:
+      type: file
+      description: Candidate-specific manifest metadata
+output:
+  - package_dir:
+      type: directory
+      description: Complete candidate package
+      pattern: package
+  - metadata:
+      type: file
+      description: Package identity, hashes, and readiness
+      pattern: "package/*.package_metadata.json"

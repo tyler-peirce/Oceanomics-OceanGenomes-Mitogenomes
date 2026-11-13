@@ -1,7 +1,7 @@
 {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "https://raw.githubusercontent.com/nf-core/oceangenomesmitogenomes/master/assets/schema_input.json",
-    "title": "nf-core/oceangenomesmitogenomes pipeline - params.input schema",
+    "$id": "https://raw.githubusercontent.com/Minderoo-OceanOmics-Centre-UWA/Oceanomics-OceanGenomes-Mitogenomes/master/assets/schema_input.json",
+    "title": "OceanOmics OceanGenomes Mitogenomes pipeline - params.input schema",
     "description": "Schema for the file provided with params.input",
     "type": "array",
     "items": {
@@ -9,10 +9,10 @@
         "properties": {
             "sample": {
                 "type": "string",
-                "pattern": "^OG\\d+[A-Za-z]?(-\\d+)?(?:_HIC[A-Za-z]*\\d*)?$",
-                "errorMessage": "Sample name must start with 'OG' followed by numbers, optionally followed by a letter and/or dash-number (e.g., OG820M-1, OG785, OG764)",
+                "pattern": "^[^\\s]+$",
+                "errorMessage": "Sample name must be a non-empty string without whitespace",
                 "meta": ["id"],
-                "description": "Sample identifier starting with OG followed by numbers"
+                "description": "Sample identifier (any non-empty string without spaces)"
             },
             "fastq_1": {
                 "type": "string",
@@ -43,6 +43,82 @@
                 "enum": ["hic", "hifi", "ilmn"],
                 "errorMessage": "Sequencing type must be one of: hic, hifi, or ilmn",
                 "description": "Type of sequencing technology used: hic (Hi-C), hifi (PacBio HiFi), or ilmn (Illumina)"
+            },
+            "single_end": {
+                "anyOf": [
+                    { "type": "boolean" },
+                    { "type": "string" }
+                ],
+                "meta": ["single_end"],
+                "description": "Whether the sample is single-end (true) or paired-end (false)"
+            },
+            "original_id": {
+                "type": "string",
+                "meta": ["original_id"],
+                "description": "Original sample identifier before any cleaning or normalization"
+            },
+            "completion_date": {
+                "anyOf": [
+                    { "type": "integer" },
+                    { "type": "string" }
+                ],
+                "meta": ["completion_date"],
+                "description": "HiFi completion date parsed from filename (YYMMDD)"
+            },
+            "date": {
+                "anyOf": [
+                    { "type": "integer" },
+                    { "type": "string" }
+                ],
+                "meta": ["date"],
+                "description": "Sequencing date derived from filename or database (YYMMDD)"
+            },
+            "assembly_prefix": {
+                "type": "string",
+                "meta": ["assembly_prefix"],
+                "description": "Assembly prefix derived from sample id, sequencing type, and date"
+            },
+            "nominal_species_id": {
+                "type": "string",
+                "meta": ["nominal_species_id"],
+                "description": "Nominal species identifier from the sample table"
+            },
+            "reference_species_id": {
+                "type": "string",
+                "meta": ["reference_species_id"],
+                "description": "NCBI-valid taxon name (species, else genus/family) resolved from nominal_species_id, used as the MitoHiFi reference query and GetOrganelle reseed source."
+            },
+            "class": {
+                "type": "string",
+                "meta": ["class"],
+                "description": "NCBI taxonomic class resolved from nominal_species_id (e.g. Actinopteri, Anthozoa). Used to select downstream resources."
+            },
+            "family": {
+                "type": "string",
+                "meta": ["family"],
+                "description": "Taxonomic family resolved from nominal_species_id (e.g. Labridae). Optional. Lets the reference-divergence guard distinguish a same-family reference from one that fell back past family level."
+            },
+            "order": {
+                "type": "string",
+                "meta": ["order"],
+                "description": "Taxonomic order resolved from nominal_species_id (e.g. Labriformes). Optional. Enables the CROSS_ORDER tier, which routes HiFi samples whose reference came from a different order to reference-free assembly instead of MitoHiFi."
+            },
+            "invertebrates": {
+                "anyOf": [
+                    { "type": "boolean" },
+                    { "type": "string" }
+                ],
+                "meta": ["invertebrates"],
+                "description": "Whether the sample is an invertebrate (true/false)"
+            },
+            "genetic_code": {
+                "anyOf": [
+                    { "type": "integer" },
+                    { "type": "string", "maxLength": 0 },
+                    { "type": "string", "pattern": "^[0-9]+$" }
+                ],
+                "meta": ["genetic_code"],
+                "description": "Optional explicit NCBI mitochondrial translation table (e.g. 2, 4, 5, 9). When set it overrides the class-derived code resolved in prepare_samplesheet."
             }
         },
         "required": ["sample", "fastq_1", "sequencing_type"]

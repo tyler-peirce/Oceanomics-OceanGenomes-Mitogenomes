@@ -1,0 +1,102 @@
+nextflow_workflow {
+    name "Run-wide ENA study resolution"
+    script "./main.nf"
+    workflow "ENA_TARGETS"
+
+    test("every candidate carries the run's study, whatever its technology") {
+        when {
+            params {
+                ena_study = 'PRJEB110568'
+            }
+            workflow {
+                """
+                input[0] = Channel.of(
+                    [id: 'OG910', sequencing_type: 'hifi', full_seqid: 'OG910.hifi.250101.v3mitohifi.emma102'],
+                    [id: 'OG910', sequencing_type: 'hic', full_seqid: 'OG910.hic.250101.getorg1770.emma102'],
+                    [id: 'OG910', sequencing_type: 'ilmn', full_seqid: 'OG910.ilmn.250101.getorg1770.emma102']
+                )
+                """
+            }
+        }
+
+        then {
+            def resolved = workflow.out.resolved.collectEntries { [(it.sequencing_type): it] }
+            assertAll(
+                { assert workflow.success },
+                // One study is created upstream per run, so technology no longer
+                // selects between studies.
+                { assert resolved.values().every { it.ena_study == 'PRJEB110568' } },
+                { assert resolved.values().collect { it.ena_study }.unique().size() == 1 },
+                // Locus tags are assigned by the downstream submission pipeline,
+                // so nothing here may attach a prefix to a candidate.
+                { assert resolved.values().every { !it.containsKey('ena_locus_prefix') } }
+            )
+        }
+    }
+
+    test("a candidate with no technology still resolves") {
+        when {
+            params {
+                ena_study = 'PRJEB110568'
+            }
+            workflow {
+                """
+                input[0] = Channel.of(
+                    [id: 'OG910', mt_assembly_prefix: 'OG910.hic.250101.getorg1770']
+                )
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.out.resolved[0].ena_study == 'PRJEB110568' }
+            )
+        }
+    }
+
+    test("an unset study stops the run instead of defaulting") {
+        when {
+            params {
+                ena_study = null
+            }
+            workflow {
+                """
+                input[0] = Channel.of(
+                    [id: 'OG910', sequencing_type: 'hifi', full_seqid: 'OG910.hifi.250101.v3mitohifi.emma102']
+                )
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.errorReport.contains('--ena_study is not set') }
+            )
+        }
+    }
+
+    test("a value that is not an ENA study accession is rejected") {
+        when {
+            params {
+                ena_study = 'PRJNA110568'
+            }
+            workflow {
+                """
+                input[0] = Channel.of(
+                    [id: 'OG910', sequencing_type: 'hifi', full_seqid: 'OG910.hifi.250101.v3mitohifi.emma102']
+                )
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert workflow.failed },
+                { assert workflow.errorReport.contains('must be an ENA study accession') }
+            )
+        }
+    }
+}

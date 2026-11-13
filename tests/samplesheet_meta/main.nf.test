@@ -1,0 +1,266 @@
+nextflow_workflow {
+    name "Samplesheet meta shape is a function of what the sheet carries"
+    script "../../subworkflows/local/prepare_samplesheet/main.nf"
+    config "./nextflow.config"
+    workflow "PREPARE_SAMPLESHEET"
+
+    // PREPARE_SAMPLESHEET runs the real nf-schema parse, so these tests pin the exact
+    // contract that broke the pipeline once: nf-schema materialises a samplesheet column
+    // the sheet does not carry as an EMPTY LIST rather than omitting the key. Nextflow's
+    // task hash cannot see an empty collection, so a resumed run still hits a cache
+    // written before the column existed and hands back a meta with a different key set --
+    // which then fails `equals` and empties every join keyed on the whole meta map.
+    // PREPARE_SAMPLESHEET strips those placeholders so meta shape stays stable.
+
+    test("an optional column the sheet does not carry leaves no placeholder key in meta") {
+        when {
+            workflow {
+                """
+                def template = file("\${projectDir}/tests/test_data/samplesheet_meta/without_taxonomy.csv", checkIfExists: true)
+                def sheet = file("without_taxonomy.csv")
+                sheet.text = template.text.replace('__PROJECT_DIR__', "\${projectDir}")
+                input[0] = sheet.toString()
+                input[1] = null
+                input[2] = 'samplesheet'
+                """
+            }
+        }
+        then {
+            def metas = workflow.out.mitohifi_input.collectEntries { meta, _reads -> [ (meta.id): meta ] }
+            assertAll(
+                { assert workflow.success },
+                { assert metas.keySet().toSorted() == ['OGCORAL', 'OGFISH'] },
+                // schema_input.json declares `family` and `order`; this sheet has neither
+                // column, so neither key may appear. This is the regression itself.
+                { assert metas.values().every { !it.containsKey('family') } },
+                { assert metas.values().every { !it.containsKey('order') } },
+                // A blank cell in a column the sheet DOES carry is the same "no value"
+                // placeholder and goes the same way.
+                { assert !metas.OGFISH.containsKey('original_id') },
+                { assert metas.OGCORAL.original_id == 'OGCORAL' },
+                // Everything the sheet actually carries survives untouched.
+                { assert metas.OGFISH.assembly_prefix == 'OGFISH.hifi.250101' },
+                { assert metas.OGFISH.date == '250101' },
+                { assert metas.OGFISH.class == 'Actinopteri' }
+            )
+        }
+    }
+
+    test("a populated optional column reaches meta unchanged") {
+        when {
+            workflow {
+                """
+                def template = file("\${projectDir}/tests/test_data/samplesheet_meta/with_taxonomy.csv", checkIfExists: true)
+                def sheet = file("with_taxonomy.csv")
+                sheet.text = template.text.replace('__PROJECT_DIR__', "\${projectDir}")
+                input[0] = sheet.toString()
+                input[1] = null
+                input[2] = 'samplesheet'
+                """
+            }
+        }
+        then {
+            def metas = workflow.out.mitohifi_input.collectEntries { meta, _reads -> [ (meta.id): meta ] }
+            assertAll(
+                { assert workflow.success },
+                { assert metas.keySet().toSorted() == ['OGCORAL', 'OGFISH'] },
+                // A real value is a String, never a Collection, so the placeholder strip
+                // cannot touch it. REFERENCE_DIVERGENCE reads these two keys to pass
+                // --sample-family / --sample-order, which is what enables the CROSS_ORDER
+                // tier; if they were dropped, grading would silently fall back to genus.
+                { assert metas.OGFISH.family == 'Lutjanidae' },
+                { assert metas.OGFISH.order == 'Eupercaria' },
+                { assert metas.OGCORAL.family == 'Acroporidae' },
+                { assert metas.OGCORAL.order == 'Scleractinia' },
+                { assert metas.values().every { it.family instanceof String && it.order instanceof String } }
+            )
+        }
+    }
+
+    test("the class-driven genetic code still derives through the placeholder strip") {
+        when {
+            workflow {
+                """
+                def template = file("\${projectDir}/tests/test_data/samplesheet_meta/with_taxonomy.csv", checkIfExists: true)
+                def sheet = file("with_taxonomy.csv")
+                sheet.text = template.text.replace('__PROJECT_DIR__', "\${projectDir}")
+                input[0] = sheet.toString()
+                input[1] = null
+                input[2] = 'samplesheet'
+                """
+            }
+        }
+        then {
+            def metas = workflow.out.mitohifi_input.collectEntries { meta, _reads -> [ (meta.id): meta ] }
+            assertAll(
+                { assert workflow.success },
+                // mitoGeneticCode() reads meta.class immediately after the strip, so this
+                // pins that the strip left the taxonomy it depends on in place.
+                { assert metas.OGFISH.genetic_code == 2 },
+                { assert metas.OGFISH.invertebrates == false },
+                { assert metas.OGCORAL.genetic_code == 4 },
+                { assert metas.OGCORAL.invertebrates == true }
+            )
+        }
+    }
+
+    test("non-coral invertebrate classes resolve their own genetic codes") {
+        // Pins mitoGeneticCode()'s generalisation beyond Cnidaria, reading
+        // assets/taxonomy/mito_genetic_codes.json: Mollusca and Arthropoda (Crustacea +
+        // Pycnogonida) resolve to the standard Invertebrate code (5), not the
+        // Coelenterate code (4) corals use; Echinodermata keeps 9; Porifera groups
+        // with Cnidaria on 4, as does Ctenophora (NCBI's table 4 scope is
+        // "Coelenterata (Ctenophora and Cnidaria)"); tunicates are 13 despite
+        // sitting inside Chordata. A class the asset does not map aborts instead
+        // -- covered separately below.
+        when {
+            workflow {
+                """
+                def template = file("\${projectDir}/tests/test_data/samplesheet_meta/with_taxonomy_inverts.csv", checkIfExists: true)
+                def sheet = file("with_taxonomy_inverts.csv")
+                sheet.text = template.text.replace('__PROJECT_DIR__', "\${projectDir}")
+                input[0] = sheet.toString()
+                input[1] = null
+                input[2] = 'samplesheet'
+                """
+            }
+        }
+        then {
+            def metas = workflow.out.mitohifi_input.collectEntries { meta, _reads -> [ (meta.id): meta ] }
+            assertAll(
+                { assert workflow.success },
+                { assert metas.OGMOLLUSC.genetic_code == 5 },
+                { assert metas.OGCRUST.genetic_code == 5 },
+                { assert metas.OGPYCNO.genetic_code == 5 },
+                { assert metas.OGECHINO.genetic_code == 9 },
+                { assert metas.OGSPONGE.genetic_code == 4 },
+                { assert metas.OGCTENO.genetic_code == 4 },
+                { assert metas.OGTUNIC.genetic_code == 13 },
+                { assert metas.values().every { it.invertebrates == true } }
+            )
+        }
+    }
+
+    // An unresolved class is not a neutral value: is_invertebrate() reads it as
+    // 'false', so the sample silently takes the vertebrate genetic code, EMMA over
+    // MITOS2 and the curated fish BLAST DB. The run must stop before any of that.
+    test("an unknown class aborts the run and names the sample") {
+        when {
+            params {
+                allow_unknown_taxonomy = false
+            }
+            workflow {
+                """
+                def template = file("\${projectDir}/tests/test_data/samplesheet_meta/unknown_class.csv", checkIfExists: true)
+                def sheet = file("unknown_class.csv")
+                sheet.text = template.text.replace('__PROJECT_DIR__', "\${projectDir}")
+                input[0] = sheet.toString()
+                input[1] = null
+                input[2] = 'samplesheet'
+                """
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.failed },
+                // error() inside a channel operator only prints InvocationTargetException, so
+                // the sample list is logged separately; that log line is what has to reach
+                // the console for the message to be actionable.
+                { assert workflow.stdout.any { it.contains('Taxonomic class is unresolved') } },
+                { assert workflow.stdout.any { it.contains("OGCORAL (nominal_species_id='Acropora tenuis')") } },
+                // The resolved sample must not be named as a problem.
+                { assert !workflow.stdout.any { it.contains("OGFISH (nominal_species_id='Lutjanus quinquelineatus')") } }
+            )
+        }
+    }
+
+    // F1: an invertebrate whose (resolved) class is not in mitoGeneticCode()'s map
+    // and which carries no explicit genetic_code column must abort, not silently
+    // fall back to code 4. Bivalvia is code 5; a wrong default mistranslates the
+    // whole annotation and fails table2asn terminally.
+    test("an invertebrate with an unmapped class aborts and names the sample") {
+        // There is no catch-all code-5 default: an invertebrate class that
+        // assets/taxonomy/mito_genetic_codes.json does not map must stop the run so the code
+        // is resolved before annotation, not silently guessed. Pterobranchia is the
+        // case in point -- the class spans Rhabdopleuridae (code 24) and
+        // Cephalodiscidae (33), so it cannot be resolved at class rank at all.
+        when {
+            workflow {
+                """
+                def template = file("\${projectDir}/tests/test_data/samplesheet_meta/with_taxonomy.csv", checkIfExists: true)
+                def sheet = file("unmapped_invert.csv")
+                sheet.text = template.text
+                    .replace('__PROJECT_DIR__', "\${projectDir}")
+                    .replace(',Anthozoa,Acroporidae,Scleractinia,true,', ',Pterobranchia,Rhabdopleuridae,Rhabdopleurida,true,')
+                input[0] = sheet.toString()
+                input[1] = null
+                input[2] = 'samplesheet'
+                """
+            }
+        }
+        then {
+            // error() raised inside the samplesheet .map closure surfaces as an
+            // InvocationTargetException at the mitoGeneticCode() call site, same
+            // as the unresolved-class guard above; the run stopping is the
+            // contract under test.
+            assert workflow.failed
+        }
+    }
+
+    test("an explicit genetic_code column overrides the class-derived code") {
+        // The per-sample column is the escape hatch for a lineage whose code
+        // differs from its group default, so it must win over the class map even
+        // when the class is mapped (Anthozoa would otherwise resolve to 4).
+        when {
+            workflow {
+                """
+                def template = file("\${projectDir}/tests/test_data/samplesheet_meta/with_taxonomy.csv", checkIfExists: true)
+                def sheet = file("explicit_code.csv")
+                def lines = template.text.replace('__PROJECT_DIR__', "\${projectDir}").trim().split('\\n')
+                def rows = [ lines[0] + ',genetic_code' ]
+                lines.drop(1).each { line ->
+                    rows << line + (line.startsWith('OGCORAL,') ? ',13' : ',')
+                }
+                sheet.text = rows.join('\\n') + '\\n'
+                input[0] = sheet.toString()
+                input[1] = null
+                input[2] = 'samplesheet'
+                """
+            }
+        }
+        then {
+            def metas = workflow.out.mitohifi_input.collectEntries { meta, _reads -> [ (meta.id): meta ] }
+            assertAll(
+                { assert workflow.success },
+                { assert metas.OGCORAL.genetic_code == 13 },
+                { assert metas.OGFISH.genetic_code == 2 }
+            )
+        }
+    }
+
+    test("--allow_unknown_taxonomy downgrades the abort to a warning") {
+        when {
+            params {
+                allow_unknown_taxonomy = true
+            }
+            workflow {
+                """
+                def template = file("\${projectDir}/tests/test_data/samplesheet_meta/unknown_class.csv", checkIfExists: true)
+                def sheet = file("unknown_class.csv")
+                sheet.text = template.text.replace('__PROJECT_DIR__', "\${projectDir}")
+                input[0] = sheet.toString()
+                input[1] = null
+                input[2] = 'samplesheet'
+                """
+            }
+        }
+        then {
+            def metas = workflow.out.mitohifi_input.collectEntries { meta, _reads -> [ (meta.id): meta ] }
+            assertAll(
+                { assert workflow.success },
+                { assert metas.keySet().toSorted() == ['OGCORAL', 'OGFISH'] },
+                { assert metas.OGCORAL.class == 'unknown' }
+            )
+        }
+    }
+}

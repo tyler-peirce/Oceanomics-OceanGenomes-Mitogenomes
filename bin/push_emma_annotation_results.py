@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-#singularity run $SING/psycopg2:0.1.sif python push_emma_annotation_results.py /home/tpeirce/postgresql_details/oceanomics.cfg OGtest /scratch/pawsey0964/tpeirce/_NFCORE/_OUT_DIR/mitogenomes/OG900/OG900.ilmn.250131.getorg1770/emma/structure_check/annotation_stats.csv
+#singularity run $SING/psycopg2:0.1.sif python push_emma_annotation_results.py /home/tpeirce/postgresql_details/oceanomics.cfg OGtest /scratch/pawsey0964/tpeirce/_NFCORE/_OUT_DIR/mitogenomes/OG900/OG900.ilmn.250131.getorg1770/annotation/structure_check/annotation_stats.csv
+import argparse
 import psycopg2
 import pandas as pd
 import numpy as np
@@ -11,6 +12,134 @@ from pathlib import Path
 # -------------------------------
 # Load DB credentials from .cfg
 # -------------------------------
+# Columns whose presence makes an incoming annotation row "complete" enough to
+# supersede a stored one. These are fields annotation_stats.py always writes on a
+# successful run (it emits 'ok'/'none' rather than a blank for a clean sample,
+# precisely so blank keeps meaning "not computed"), so an absent or blank value
+# here means the annotation step did not finish, not that it found nothing.
+# Bumped whenever annotation_stats.py changes what it computes, so a stored row
+# can be identified as the product of older code rather than silently trusted.
+ANNOTATION_STATS_VERSION = "2.0.0"
+
+REQUIRED_FOR_COMPLETE = (
+    "passed",
+    "completeness_profile",
+    "annotation_integrity_status",
+)
+
+
+def is_complete_annotation(params):
+    """True when the incoming row carries a finished annotation verdict."""
+    for col in REQUIRED_FOR_COMPLETE:
+        value = params.get(col)
+        if value is None or str(value).strip() == "":
+            return False
+    return True
+
+
+# Phase R (docs/assembly_relations_plan.md §3.3-3.4): an annotation is a row of its own in
+# mito_annotation, keyed on (assembly_id, annotation), and its per-gene lengths are rows in
+# mito_annotation_gene. A re-annotation by a different annotator ADDS a row; it no longer
+# overwrites the previous annotation of the same assembly. is_selected is never touched here
+# (owner decision 3: it is set by a person, if at all).
+#
+# Summary columns this script owns in mito_annotation. manual_curation_notes is deliberately
+# absent: it is written by hand and survives every upload.
+ANNOTATION_COLUMNS = (
+    "extra_genes", "missing_genes", "trna_advisory", "order_correct", "order_variant",
+    "order_variant_taxon_check", "order_deviation", "annotation_gaps", "passed",
+    "length_emma", "cds_no", "trna_no", "rrna_no",
+    "order_status", "order_deviation_detail", "expected_lineage_genes",
+    "missing_expected_lineage_genes", "lineage_gene_advisories",
+    "mitos_unmapped_features", "mitos_known_auxiliary_features", "duplicate_loci",
+    "annotation_integrity_status", "annotation_integrity_issues",
+    # genomes_db_review migration 068: the gene-set standard `passed` was judged against.
+    "completeness_profile",
+)
+
+# Gene length parameters, by gene name (mito_gene.gene). A gene with translated_length has a
+# "<gene>_trans" parameter as well. A new gene is an entry here plus an INSERT into mito_gene;
+# no migration.
+GENE_COLUMNS = (
+    "rrna12s", "rrna16s", "atp6", "atp8", "cox1", "cox2", "cox3", "cytb",
+    "nad1", "nad2", "nad3", "nad4", "nad4l", "nad5", "nad6",
+    "trna_phe", "trna_val", "trna_leuuag", "trna_leuuaa", "trna_ile", "trna_met",
+    "trna_thr", "trna_pro", "trna_lys", "trna_asp", "trna_glu", "trna_sergcu",
+    "trna_seruga", "trna_tyr", "trna_cys", "trna_trp", "trna_ala", "trna_asn",
+    "trna_gly", "trna_arg", "trna_his", "trna_gln", "atp9", "mtmuts",
+)
+TRANSLATED_GENES = (
+    "atp6", "atp8", "cox1", "cox2", "cox3", "cytb", "nad1", "nad2", "nad3", "nad4",
+    "nad4l", "nad5", "nad6", "atp9", "mtmuts",
+)
+
+ANNOTATION_UPSERT = """
+-- annotation_updated_at is now(), the DB clock rather than the client's: "was this
+-- annotation refreshed by that run" must not depend on a worker node's time.
+INSERT INTO mito_annotation (
+    assembly_id, annotation, extra_genes, missing_genes, trna_advisory, order_correct,
+    order_variant, order_variant_taxon_check, order_deviation, annotation_gaps, passed,
+    length_emma, cds_no, trna_no, rrna_no,
+    order_status, order_deviation_detail, expected_lineage_genes,
+    missing_expected_lineage_genes, lineage_gene_advisories,
+    mitos_unmapped_features, mitos_known_auxiliary_features, duplicate_loci,
+    annotation_integrity_status, annotation_integrity_issues, completeness_profile,
+    annotation_stats_version, annotation_updated_at
+)
+VALUES (
+    %(assembly_id)s, %(annotation)s, %(extra_genes)s, %(missing_genes)s, %(trna_advisory)s, %(order_correct)s,
+    %(order_variant)s, %(order_variant_taxon_check)s, %(order_deviation)s, %(annotation_gaps)s, %(passed)s,
+    %(length_emma)s, %(cds_no)s, %(trna_no)s, %(rrna_no)s,
+    %(order_status)s, %(order_deviation_detail)s, %(expected_lineage_genes)s,
+    %(missing_expected_lineage_genes)s, %(lineage_gene_advisories)s,
+    %(mitos_unmapped_features)s, %(mitos_known_auxiliary_features)s, %(duplicate_loci)s,
+    %(annotation_integrity_status)s, %(annotation_integrity_issues)s, %(completeness_profile)s,
+    %(annotation_stats_version)s, now()
+)
+ON CONFLICT (assembly_id, annotation)
+DO UPDATE SET
+    extra_genes = EXCLUDED.extra_genes,
+    missing_genes = EXCLUDED.missing_genes,
+    trna_advisory = EXCLUDED.trna_advisory,
+    order_correct = EXCLUDED.order_correct,
+    order_variant = EXCLUDED.order_variant,
+    order_variant_taxon_check = EXCLUDED.order_variant_taxon_check,
+    order_deviation = EXCLUDED.order_deviation,
+    annotation_gaps = EXCLUDED.annotation_gaps,
+    passed = EXCLUDED.passed,
+    length_emma = EXCLUDED.length_emma,
+    cds_no = EXCLUDED.cds_no,
+    trna_no = EXCLUDED.trna_no,
+    rrna_no = EXCLUDED.rrna_no,
+    order_status = EXCLUDED.order_status,
+    order_deviation_detail = EXCLUDED.order_deviation_detail,
+    expected_lineage_genes = EXCLUDED.expected_lineage_genes,
+    missing_expected_lineage_genes = EXCLUDED.missing_expected_lineage_genes,
+    lineage_gene_advisories = EXCLUDED.lineage_gene_advisories,
+    mitos_unmapped_features = EXCLUDED.mitos_unmapped_features,
+    mitos_known_auxiliary_features = EXCLUDED.mitos_known_auxiliary_features,
+    duplicate_loci = EXCLUDED.duplicate_loci,
+    annotation_integrity_status = EXCLUDED.annotation_integrity_status,
+    annotation_integrity_issues = EXCLUDED.annotation_integrity_issues,
+    completeness_profile = EXCLUDED.completeness_profile,
+    annotation_stats_version = EXCLUDED.annotation_stats_version,
+    annotation_updated_at = EXCLUDED.annotation_updated_at,
+    updated_at = now()
+RETURNING annotation_id
+"""
+
+
+def gene_rows(annotation_id, params):
+    """(annotation_id, gene, length, translated_length) for every gene with a value."""
+    rows = []
+    for gene in GENE_COLUMNS:
+        length = params.get(gene)
+        translated = params.get(f"{gene}_trans") if gene in TRANSLATED_GENES else None
+        if length is not None or translated is not None:
+            rows.append((annotation_id, gene, length, translated))
+    return rows
+
+
 def load_db_config(config_file):
     if not Path(config_file).exists():
         raise FileNotFoundError(f"❌ Config file '{config_file}' does not exist.")
@@ -38,13 +167,31 @@ def load_db_config(config_file):
 # Main logic
 # -------------------------------
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print("Usage:\n  push_emma_annotation_results.py <config_file> <meta.id> <annotation_stats>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Push EMMA annotation stats to the OceanOmics DB."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Overwrite the annotation columns even when the existing row "
+            "already has some of them filled. Off by default: a row is only "
+            "(re)written when every annotation cell is empty; partially-filled "
+            "rows are preserved."
+        ),
+    )
+    parser.add_argument("config_file")
+    parser.add_argument("sample")
+    parser.add_argument("annotation_stats")
+    args = parser.parse_args()
 
-    config_file = sys.argv[1]
-    sample = sys.argv[2]
-    annotation_stats = sys.argv[3]
+    config_file = args.config_file
+    sample = args.sample
+    annotation_stats = args.annotation_stats
+    force_overwrite = args.force
+    # Set by a row that cannot be written; the script exits 1 at the end so the task fails
+    # (and is retried, then ignored, by Nextflow) instead of passing as a success.
+    upload_failed = False
 
     print(f"Importing data from {annotation_stats}")
     # Load and preprocess annotation data
@@ -60,121 +207,39 @@ if __name__ == "__main__":
         db_params = load_db_config(config_file)
         conn = psycopg2.connect(**db_params)
         cursor = conn.cursor()
-        
+
         for index, row in stats.iterrows():
             row_dict = row.to_dict()
             # Extract primary key values
             og_id, tech, seq_date, code = row['og_id'], row['tech'], row['seq_date'], row['code']
-
-            upsert_query = """
-            INSERT INTO mitogenome_data (
-                og_id, tech, seq_date, code, annotation, extra_genes, missing_genes, order_correct, passed, length_emma, seqlength_12s,
-                seqlength_16s, seqlength_co1, cds_no, trna_no, rrna_no, rrna12s,
-                rrna16s, atp6, atp8, cox1, cox2, cox3, cytb, nad1, nad2, nad3, nad4, nad4l, 
-                nad5, nad6, trna_phe, trna_val, trna_leuuag, trna_leuuaa, trna_ile, trna_met, 
-                trna_thr, trna_pro, trna_lys, trna_asp, trna_glu, trna_sergcu, trna_seruga, 
-                trna_tyr, trna_cys, trna_trp, trna_ala, trna_asn, trna_gly, trna_arg, trna_his, 
-                trna_gln, atp6_trans, atp8_trans, cox1_trans, cox2_trans, cox3_trans, cytb_trans, nad1_trans, 
-                nad2_trans, nad3_trans, nad4_trans, nad4l_trans, nad5_trans, nad6_trans
-            )
-            VALUES (
-                %(og_id)s, %(tech)s, %(seq_date)s, %(code)s, %(annotation)s, %(extra_genes)s, %(missing_genes)s, %(order_correct)s, %(passed)s, %(length_emma)s, %(seqlength_12s)s,
-                %(seqlength_16s)s, %(seqlength_co1)s, %(cds_no)s, %(trna_no)s, %(rrna_no)s, %(rrna12s)s,
-                %(rrna16s)s, %(atp6)s, %(atp8)s, %(cox1)s, %(cox2)s, %(cox3)s, %(cytb)s, %(nad1)s, %(nad2)s, %(nad3)s, %(nad4)s, %(nad4l)s,
-                %(nad5)s, %(nad6)s, %(trna_phe)s, %(trna_val)s, %(trna_leuuag)s, %(trna_leuuaa)s, %(trna_ile)s, %(trna_met)s,
-                %(trna_thr)s, %(trna_pro)s, %(trna_lys)s, %(trna_asp)s, %(trna_glu)s, %(trna_sergcu)s, %(trna_seruga)s,
-                %(trna_tyr)s, %(trna_cys)s, %(trna_trp)s, %(trna_ala)s, %(trna_asn)s, %(trna_gly)s, %(trna_arg)s, %(trna_his)s,
-                %(trna_gln)s, %(atp6_trans)s, %(atp8_trans)s, %(cox1_trans)s, %(cox2_trans)s, %(cox3_trans)s, %(cytb_trans)s, %(nad1_trans)s, %(nad2_trans)s, 
-                %(nad3_trans)s, %(nad4_trans)s, %(nad4l_trans)s, %(nad5_trans)s, %(nad6_trans)s
-            )
-            ON CONFLICT (og_id, tech, seq_date, code) 
-            DO UPDATE SET
-                annotation = CASE WHEN mitogenome_data.annotation IS NULL THEN EXCLUDED.annotation ELSE mitogenome_data.annotation END,
-                extra_genes = CASE WHEN mitogenome_data.extra_genes IS NULL THEN EXCLUDED.extra_genes ELSE mitogenome_data.extra_genes END,
-                missing_genes = CASE WHEN mitogenome_data.missing_genes IS NULL THEN EXCLUDED.missing_genes ELSE mitogenome_data.missing_genes END,
-                order_correct = CASE WHEN mitogenome_data.order_correct IS NULL THEN EXCLUDED.order_correct ELSE mitogenome_data.order_correct END,
-                passed = CASE WHEN mitogenome_data.passed IS NULL THEN EXCLUDED.passed ELSE mitogenome_data.passed END,
-                length_emma = CASE WHEN mitogenome_data.length_emma IS NULL THEN EXCLUDED.length_emma ELSE mitogenome_data.length_emma END,
-                seqlength_12s = CASE WHEN mitogenome_data.seqlength_12s IS NULL THEN EXCLUDED.seqlength_12s ELSE mitogenome_data.seqlength_12s END,
-                seqlength_16s = CASE WHEN mitogenome_data.seqlength_16s IS NULL THEN EXCLUDED.seqlength_16s ELSE mitogenome_data.seqlength_16s END,
-                seqlength_co1 = CASE WHEN mitogenome_data.seqlength_co1 IS NULL THEN EXCLUDED.seqlength_co1 ELSE mitogenome_data.seqlength_co1 END,
-                cds_no = CASE WHEN mitogenome_data.cds_no IS NULL THEN EXCLUDED.cds_no ELSE mitogenome_data.cds_no END,
-                trna_no = CASE WHEN mitogenome_data.trna_no IS NULL THEN EXCLUDED.trna_no ELSE mitogenome_data.trna_no END,
-                rrna_no = CASE WHEN mitogenome_data.rrna_no IS NULL THEN EXCLUDED.rrna_no ELSE mitogenome_data.rrna_no END,
-                rrna12s = CASE WHEN mitogenome_data.rrna12s IS NULL THEN EXCLUDED.rrna12s ELSE mitogenome_data.rrna12s END,
-                rrna16s = CASE WHEN mitogenome_data.rrna16s IS NULL THEN EXCLUDED.rrna16s ELSE mitogenome_data.rrna16s END,
-                atp6  = CASE WHEN mitogenome_data.atp6 IS NULL THEN EXCLUDED.atp6 ELSE mitogenome_data.atp6 END,
-                atp8  = CASE WHEN mitogenome_data.atp8 IS NULL THEN EXCLUDED.atp8 ELSE mitogenome_data.atp8 END,
-                cox1  = CASE WHEN mitogenome_data.cox1 IS NULL THEN EXCLUDED.cox1 ELSE mitogenome_data.cox1 END,
-                cox2  = CASE WHEN mitogenome_data.cox2 IS NULL THEN EXCLUDED.cox2 ELSE mitogenome_data.cox2 END,
-                cox3  = CASE WHEN mitogenome_data.cox3 IS NULL THEN EXCLUDED.cox3 ELSE mitogenome_data.cox3 END,
-                cytb  = CASE WHEN mitogenome_data.cytb IS NULL THEN EXCLUDED.cytb ELSE mitogenome_data.cytb END,
-                nad1  = CASE WHEN mitogenome_data.nad1 IS NULL THEN EXCLUDED.nad1 ELSE mitogenome_data.nad1 END,
-                nad2  = CASE WHEN mitogenome_data.nad2 IS NULL THEN EXCLUDED.nad2 ELSE mitogenome_data.nad2 END,
-                nad3  = CASE WHEN mitogenome_data.nad3 IS NULL THEN EXCLUDED.nad3 ELSE mitogenome_data.nad3 END,
-                nad4  = CASE WHEN mitogenome_data.nad4 IS NULL THEN EXCLUDED.nad4 ELSE mitogenome_data.nad4 END,
-                nad4l = CASE WHEN mitogenome_data.nad4l IS NULL THEN EXCLUDED.nad4l ELSE mitogenome_data.nad4l END,
-                nad5  = CASE WHEN mitogenome_data.nad5 IS NULL THEN EXCLUDED.nad5 ELSE mitogenome_data.nad5 END,
-                nad6  = CASE WHEN mitogenome_data.nad6 IS NULL THEN EXCLUDED.nad6 ELSE mitogenome_data.nad6 END,
-                trna_phe = CASE WHEN mitogenome_data.trna_phe IS NULL THEN EXCLUDED.trna_phe ELSE mitogenome_data.trna_phe END,
-                trna_val = CASE WHEN mitogenome_data.trna_val IS NULL THEN EXCLUDED.trna_val ELSE mitogenome_data.trna_val END,
-                trna_leuuag = CASE WHEN mitogenome_data.trna_leuuag IS NULL THEN EXCLUDED.trna_leuuag ELSE mitogenome_data.trna_leuuag END,
-                trna_leuuaa = CASE WHEN mitogenome_data.trna_leuuaa IS NULL THEN EXCLUDED.trna_leuuaa ELSE mitogenome_data.trna_leuuaa END,
-                trna_ile = CASE WHEN mitogenome_data.trna_ile IS NULL THEN EXCLUDED.trna_ile ELSE mitogenome_data.trna_ile END,
-                trna_met = CASE WHEN mitogenome_data.trna_met IS NULL THEN EXCLUDED.trna_met ELSE mitogenome_data.trna_met END,
-                trna_thr = CASE WHEN mitogenome_data.trna_thr IS NULL THEN EXCLUDED.trna_thr ELSE mitogenome_data.trna_thr END,
-                trna_pro = CASE WHEN mitogenome_data.trna_pro IS NULL THEN EXCLUDED.trna_pro ELSE mitogenome_data.trna_pro END,
-                trna_lys = CASE WHEN mitogenome_data.trna_lys IS NULL THEN EXCLUDED.trna_lys ELSE mitogenome_data.trna_lys END,
-                trna_asp = CASE WHEN mitogenome_data.trna_asp IS NULL THEN EXCLUDED.trna_asp ELSE mitogenome_data.trna_asp END,
-                trna_glu = CASE WHEN mitogenome_data.trna_glu IS NULL THEN EXCLUDED.trna_glu ELSE mitogenome_data.trna_glu END,
-                trna_sergcu = CASE WHEN mitogenome_data.trna_sergcu IS NULL THEN EXCLUDED.trna_sergcu ELSE mitogenome_data.trna_sergcu END,
-                trna_seruga = CASE WHEN mitogenome_data.trna_seruga IS NULL THEN EXCLUDED.trna_seruga ELSE mitogenome_data.trna_seruga END,
-                trna_tyr = CASE WHEN mitogenome_data.trna_tyr IS NULL THEN EXCLUDED.trna_tyr ELSE mitogenome_data.trna_tyr END,
-                trna_cys = CASE WHEN mitogenome_data.trna_cys IS NULL THEN EXCLUDED.trna_cys ELSE mitogenome_data.trna_cys END,
-                trna_trp = CASE WHEN mitogenome_data.trna_trp IS NULL THEN EXCLUDED.trna_trp ELSE mitogenome_data.trna_trp END,
-                trna_ala = CASE WHEN mitogenome_data.trna_ala IS NULL THEN EXCLUDED.trna_ala ELSE mitogenome_data.trna_ala END,
-                trna_asn = CASE WHEN mitogenome_data.trna_asn IS NULL THEN EXCLUDED.trna_asn ELSE mitogenome_data.trna_asn END,
-                trna_gly = CASE WHEN mitogenome_data.trna_gly IS NULL THEN EXCLUDED.trna_gly ELSE mitogenome_data.trna_gly END,
-                trna_arg = CASE WHEN mitogenome_data.trna_arg IS NULL THEN EXCLUDED.trna_arg ELSE mitogenome_data.trna_arg END,
-                trna_his = CASE WHEN mitogenome_data.trna_his IS NULL THEN EXCLUDED.trna_his ELSE mitogenome_data.trna_his END,
-                trna_gln = CASE WHEN mitogenome_data.trna_gln IS NULL THEN EXCLUDED.trna_gln ELSE mitogenome_data.trna_gln END,
-                atp6_trans = CASE WHEN mitogenome_data.atp6_trans IS NULL THEN EXCLUDED.atp6_trans ELSE mitogenome_data.atp6_trans END,
-                atp8_trans = CASE WHEN mitogenome_data.atp8_trans IS NULL THEN EXCLUDED.atp8_trans ELSE mitogenome_data.atp8_trans END,
-                cox1_trans = CASE WHEN mitogenome_data.cox1_trans IS NULL THEN EXCLUDED.cox1_trans ELSE mitogenome_data.cox1_trans END,
-                cox2_trans = CASE WHEN mitogenome_data.cox2_trans IS NULL THEN EXCLUDED.cox2_trans ELSE mitogenome_data.cox2_trans END,
-                cox3_trans = CASE WHEN mitogenome_data.cox3_trans IS NULL THEN EXCLUDED.cox3_trans ELSE mitogenome_data.cox3_trans END,
-                cytb_trans = CASE WHEN mitogenome_data.cytb_trans IS NULL THEN EXCLUDED.cytb_trans ELSE mitogenome_data.cytb_trans END,
-                nad1_trans = CASE WHEN mitogenome_data.nad1_trans IS NULL THEN EXCLUDED.nad1_trans ELSE mitogenome_data.nad1_trans END,
-                nad2_trans = CASE WHEN mitogenome_data.nad2_trans IS NULL THEN EXCLUDED.nad2_trans ELSE mitogenome_data.nad2_trans END,
-                nad3_trans = CASE WHEN mitogenome_data.nad3_trans IS NULL THEN EXCLUDED.nad3_trans ELSE mitogenome_data.nad3_trans END,
-                nad4_trans = CASE WHEN mitogenome_data.nad4_trans IS NULL THEN EXCLUDED.nad4_trans ELSE mitogenome_data.nad4_trans END,
-                nad4l_trans = CASE WHEN mitogenome_data.nad4l_trans IS NULL THEN EXCLUDED.nad4l_trans ELSE mitogenome_data.nad4l_trans END,
-                nad5_trans = CASE WHEN mitogenome_data.nad5_trans IS NULL THEN EXCLUDED.nad5_trans ELSE mitogenome_data.nad5_trans END,
-                nad6_trans = CASE WHEN mitogenome_data.nad6_trans IS NULL THEN EXCLUDED.nad6_trans ELSE mitogenome_data.nad6_trans END
-            RETURNING annotation, extra_genes, missing_genes, order_correct, passed, length_emma, seqlength_12s,
-                seqlength_16s, seqlength_co1, cds_no, trna_no, rrna_no, rrna12s,
-                rrna16s, atp6, atp8, cox1, cox2, cox3, cytb, nad1, nad2, nad3, nad4, nad4l, 
-                nad5, nad6, trna_phe, trna_val, trna_leuuag, trna_leuuaa, trna_ile, trna_met, 
-                trna_thr, trna_pro, trna_lys, trna_asp, trna_glu, trna_sergcu, trna_seruga, 
-                trna_tyr, trna_cys, trna_trp, trna_ala, trna_asn, trna_gly, trna_arg, trna_his, 
-                trna_gln, atp6_trans, atp8_trans, cox1_trans, cox2_trans, cox3_trans, cytb_trans, nad1_trans, 
-                nad2_trans, nad3_trans, nad4_trans, nad4l_trans, nad5_trans, nad6_trans
-            """
+            # seq_date is a TEXT column in the DB, but pandas reads 260514 as an int.
+            # Bind it as a string so the key comparison (text = %s) doesn't fail with
+            # "operator does not exist: text = integer".
+            if seq_date is not None:
+                seq_date = str(seq_date)
+            key = {"og_id": og_id, "tech": tech, "seq_date": seq_date, "code": code}
 
             params = {
                 "og_id": row_dict["og_id"],
                 "tech": row_dict["tech"],
-                "seq_date": row_dict["seq_date"],
+                "seq_date": seq_date,
                 "code": row_dict["code"],
                 "annotation": row_dict["annotation"],
                 "extra_genes": row_dict["extra_genes"],
                 "missing_genes": row_dict["missing_genes"],
+                "trna_advisory": row_dict.get("trna_advisory"),
                 "order_correct": row_dict["order_correct"],
+                # .get() rather than [] on purpose: an annotation_stats.csv written
+                # before these columns existed must still upsert. This is also the
+                # one site of the six that would fail SILENTLY on a missed name --
+                # the SQL sites raise on an unknown placeholder, this one would just
+                # write nothing.
+                "order_variant": row_dict.get("order_variant"),
+                "order_variant_taxon_check": row_dict.get("order_variant_taxon_check"),
+                "order_deviation": row_dict.get("order_deviation"),
+                "annotation_gaps": row_dict.get("annotation_gaps"),
                 "passed": row_dict["passed"],
                 "length_emma": row_dict.get("total_length"),
-                "seqlength_12s": row_dict.get("seqlength_12s"),
-                "seqlength_16s": row_dict.get("seqlength_16s"),
-                "seqlength_co1": row_dict.get("seqlength_co1"),
                 "cds_no": row_dict.get("num_cds"),
                 "trna_no": row_dict.get("num_trna"),
                 "rrna_no": row_dict.get("num_rrna"),
@@ -228,45 +293,113 @@ if __name__ == "__main__":
                 "nad4l_trans": row_dict.get("nd4l_trans"),
                 "nad5_trans": row_dict.get("nd5_trans"),
                 "nad6_trans": row_dict.get("nd6_trans"),
+                # Migration 026. Optional lookups: an annotation CSV produced
+                # before these columns existed simply yields None, which is why
+                # older CSVs stay uploadable. annotation_stats.py writes an
+                # explicit 'ok'/'none' rather than a blank for a clean sample, so
+                # NULL here means "produced by older code", not "clean".
+                "order_status": row_dict.get("order_status"),
+                "order_deviation_detail": row_dict.get("order_deviation_detail"),
+                "expected_lineage_genes": row_dict.get("expected_lineage_genes"),
+                "missing_expected_lineage_genes": row_dict.get("missing_expected_lineage_genes"),
+                "lineage_gene_advisories": row_dict.get("lineage_gene_advisories"),
+                "mitos_unmapped_features": row_dict.get("mitos_unmapped_features"),
+                "mitos_known_auxiliary_features": row_dict.get("mitos_known_auxiliary_features"),
+                "duplicate_loci": row_dict.get("duplicate_loci"),
+                "annotation_integrity_status": row_dict.get("annotation_integrity_status"),
+                "annotation_integrity_issues": row_dict.get("annotation_integrity_issues"),
+                "completeness_profile": row_dict.get("completeness_profile") or None,
+                # mitos_to_emma writes the internal key MTMUTS; the INSDC spelling
+                # mtMutS is restored at the submission boundary, not here, so the
+                # column name stays lowercase like every other gene column.
+                "atp9": row_dict.get("atp9"),
+                "atp9_trans": row_dict.get("atp9_trans"),
+                "mtmuts": row_dict.get("mtmuts"),
+                "mtmuts_trans": row_dict.get("mtmuts_trans"),
+                "annotation_stats_version": ANNOTATION_STATS_VERSION,
             }
 
-            cursor.execute(upsert_query, params)
-            returned = cursor.fetchone()
+            if not params["annotation"]:
+                print(f"❌ Database error: {og_id}.{tech}.{seq_date}.{code} has no annotation name; "
+                      "an annotation is stored under its annotator, so nothing was written.")
+                upload_failed = True
+                continue
+
+            # The assembly row is normally pre-created by the assembly upload. If it is
+            # not there yet, create the bare key (stats NULL) so the annotation has a
+            # parent, exactly as the old single-table upsert did.
+            cursor.execute(
+                """
+                INSERT INTO mito_assembly (og_id, tech, seq_date, code)
+                VALUES (%(og_id)s, %(tech)s, %(seq_date)s, %(code)s)
+                ON CONFLICT (og_id, tech, seq_date, code) DO NOTHING
+                """,
+                key,
+            )
+            cursor.execute(
+                """
+                SELECT assembly_id FROM mito_assembly
+                WHERE og_id = %(og_id)s AND tech = %(tech)s
+                  AND seq_date = %(seq_date)s AND code = %(code)s
+                """,
+                key,
+            )
+            params["assembly_id"] = cursor.fetchone()[0]
+
+            # The annotation block is written as ONE unit: the summary row and its gene
+            # rows, in one transaction.
+            #
+            # A COMPLETE incoming row supersedes the stored annotation of the same
+            # annotator in full, every summary column overwritten and the gene rows
+            # replaced. An INCOMPLETE row still preserves a stored annotation of the
+            # same annotator and still needs --force. A different annotator is a
+            # different annotation: it is added, and the existing one is left alone.
+            incoming_complete = is_complete_annotation(params)
+            if not force_overwrite and not incoming_complete:
+                cursor.execute(
+                    f"""
+                    SELECT {", ".join(ANNOTATION_COLUMNS)},
+                           (SELECT count(*) FROM mito_annotation_gene g
+                            WHERE g.annotation_id = n.annotation_id)
+                    FROM mito_annotation n
+                    WHERE n.assembly_id = %(assembly_id)s AND n.annotation = %(annotation)s
+                    """,
+                    params,
+                )
+                existing = cursor.fetchone()
+                if existing is not None and (any(v is not None for v in existing[:-1]) or existing[-1]):
+                    preserved = dict(zip(ANNOTATION_COLUMNS, existing[:-1]))
+                    preserved["gene_rows"] = existing[-1]
+                    attempted = {col: params[col] for col in ANNOTATION_COLUMNS}
+                    print(
+                        f"⚠️ Existing values preserved for {og_id}.{tech}.{seq_date}.{code}: "
+                        "the incoming annotation row is INCOMPLETE and the stored row "
+                        "already has data; pass --force to overwrite anyway."
+                    )
+                    print(f"   🔒 Preserved (kept) values:    {preserved}")
+                    print(f"   ⬆️ New values NOT uploaded:    {attempted}")
+                    conn.rollback()
+                    continue
+
+            cursor.execute(ANNOTATION_UPSERT, params)
+            annotation_id = cursor.fetchone()[0]
+            cursor.execute("DELETE FROM mito_annotation_gene WHERE annotation_id = %s", (annotation_id,))
+            genes = gene_rows(annotation_id, params)
+            if genes:
+                cursor.executemany(
+                    "INSERT INTO mito_annotation_gene (annotation_id, gene, length, translated_length) "
+                    "VALUES (%s, %s, %s, %s)",
+                    genes,
+                )
             conn.commit()
 
-            print("📌 Final stored values:")
-            print(dict(zip([
-                "annotation", "extra_genes", "missing_genes", "order_correct", "passed", "length_emma", "seqlength_12s",
-                "seqlength_16s", "seqlength_co1", "cds_no", "trna_no", "rrna_no", "rrna12s",
-                "rrna16s", "atp6", "atp8", "cox1", "cox2", "cox3", "cytb", "nad1", "nad2", "nad3", "nad4", "nad4l",
-                "nad5", "nad6", "trna_phe", "trna_val", "trna_leuuag", "trna_leuuaa", "trna_ile", "trna_met",
-                "trna_thr", "trna_pro", "trna_lys", "trna_asp", "trna_glu", "trna_sergcu", "trna_seruga",
-                "trna_tyr", "trna_cys", "trna_trp", "trna_ala", "trna_asn", "trna_gly", "trna_arg", "trna_his",
-                "trna_gln", "atp6_trans", "atp8_trans", "cox1_trans", "cox2_trans", "cox3_trans", "cytb_trans", "nad1_trans",
-                "nad2_trans", "nad3_trans", "nad4_trans", "nad4l_trans", "nad5_trans", "nad6_trans"
-            ], returned)))
-
-            # Field-by-field comparison
-            field_names = [
-                "annotation", "extra_genes", "missing_genes", "order_correct", "passed", "length_emma", "seqlength_12s",
-                "seqlength_16s", "seqlength_co1", "cds_no", "trna_no", "rrna_no", "rrna12s",
-                "rrna16s", "atp6", "atp8", "cox1", "cox2", "cox3", "cytb", "nad1", "nad2", "nad3", "nad4", "nad4l",
-                "nad5", "nad6", "trna_phe", "trna_val", "trna_leuuag", "trna_leuuaa", "trna_ile", "trna_met",
-                "trna_thr", "trna_pro", "trna_lys", "trna_asp", "trna_glu", "trna_sergcu", "trna_seruga",
-                "trna_tyr", "trna_cys", "trna_trp", "trna_ala", "trna_asn", "trna_gly", "trna_arg", "trna_his",
-                "trna_gln", "atp6_trans", "atp8_trans", "cox1_trans", "cox2_trans", "cox3_trans", "cytb_trans", "nad1_trans",
-                "nad2_trans", "nad3_trans", "nad4_trans", "nad4l_trans", "nad5_trans", "nad6_trans"
-            ]
-            preserved_fields = []
-
-            for idx, field in enumerate(field_names):
-                if params[field] is None:
-                    continue  # Skipped intentionally
-                elif returned[idx] != params[field]:
-                    preserved_fields.append(field)
-
-            if preserved_fields:
-                print(f"⚠️ Existing values preserved for: {', '.join(preserved_fields)}")
+            final = {"annotation_id": annotation_id, "annotation": params["annotation"]}
+            final.update({col: params[col] for col in ANNOTATION_COLUMNS})
+            final["gene_rows"] = len(genes)
+            print(f"📌 Final stored values: {final}")
+            # Parsed by bin/compile_upload_report.py, hence still "mitogenome_data".
+            if force_overwrite:
+                print(f"✅ Success: Overwrote mitogenome_data for {sample} (--force).")
             else:
                 print(f"✅ Success: Inserted/Updated mitogenome_data for {sample}")
 
@@ -275,9 +408,13 @@ if __name__ == "__main__":
         if 'conn' in locals():
             conn.rollback()
         print(f"❌ Database error: {e}")
+        upload_failed = True
 
     finally:
         if 'cursor' in locals():
             cursor.close()
         if 'conn' in locals():
             conn.close()
+
+    if upload_failed:
+        sys.exit(1)

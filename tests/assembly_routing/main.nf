@@ -1,0 +1,159 @@
+nextflow.enable.dsl = 2
+
+include { MITOHIFI_FINDMITOREFERENCE } from '../../modules/nf-core/mitohifi/findmitoreference/main'
+
+workflow REFERENCE_POLICY {
+    take:
+    samples
+
+    main:
+    MITOHIFI_FINDMITOREFERENCE(samples)
+
+    emit:
+    reference = MITOHIFI_FINDMITOREFERENCE.out.reference
+    status = MITOHIFI_FINDMITOREFERENCE.out.status
+}
+
+// Import the real implementation rather than copying it, so this cannot silently pass
+// against a stale duplicate of the logic it is meant to protect. (It previously WAS such a
+// duplicate: a copy of the old groupTuple selection, fed hand-written inputs in which the
+// canonical row carried the final variant's prefix. The duplicate also could not run at all,
+// so nobody noticed.)
+//
+// The canonical row now carries the WINNING assembly's own name, so this selection excludes
+// the winner and keeps every superseded attempt. It used to exclude the first pass, which was
+// correct only while the canonical row was misnamed -- filed under the sample-level prefix
+// even when the molecule in it was a reseed. That misnaming is what dropped curated assemblies
+// at the QC gate and filed their depth against a superseded row.
+include { selectProvenanceVariants } from '../../subworkflows/local/mitogenome_assembly/getorganelle/main.nf'
+
+// Same reasoning as above: import the real Oatk-fallback predicate, not a copy. It decides
+// whether a MitoHiFi assembly is defective enough to re-assemble reference-free, from files
+// on disk, so the tests hand it real (tiny) artefacts rather than pre-parsed values -- that
+// way the parsers it depends on (countGenbankCds, parseLengthRatio, parseRelevanceVerdict)
+// are exercised too, and a change to the TSV shapes cannot pass silently.
+include { oatkFallbackReason } from '../../subworkflows/local/mitogenome_assembly/mitohifi/main.nf'
+
+// Same reasoning again: import the real partial-failure predicate and the real
+// was_circular reader, not copies. These two decide whether a MitoHiFi assembly that
+// crashed midway is carried through the subworkflow at all, and what topology it is
+// recorded with. OG2133 was lost because the first of them did not exist.
+include { mitohifiPartialFailure; mitohifiStatsCircular } from '../../subworkflows/local/mitogenome_assembly/mitohifi/main.nf'
+
+// Same reasoning again: import the real reseed-vs-first-pass predicate. It used to be
+// `rs_fasta.size() > 0` under a comment claiming it picked "the better of" the two, so
+// any non-empty reseed displaced the first pass -- which is how INV04_BOLOCERA published
+// a 12-scaffold reseed over its own 2-scaffold first pass. The cases below are that
+// sample and its panel-mate, at their real sizes.
+include { preferReseed } from '../../subworkflows/local/mitogenome_assembly/getorganelle/main.nf'
+
+// The predicate that decides between the top-n seed subset and the whole-group
+// rescue. Imported, not copied, for the same reason as everything above: it is what
+// stands between an empty first pass and never being reseeded at all.
+include { firstPassEmpty } from '../../subworkflows/local/mitogenome_assembly/getorganelle/main.nf'
+
+workflow FIRST_PASS_EMPTY {
+    take:
+    assemblies   // channel of [ label, fasta ]
+
+    main:
+    verdict = assemblies.map { label, fasta -> tuple(label, firstPassEmpty(fasta)) }
+
+    emit:
+    verdict
+}
+
+workflow MITOHIFI_PARTIAL_FAILURE {
+    take:
+    cases   // [ label, command_log ]
+
+    main:
+    results = cases.map { label, log -> [ label, mitohifiPartialFailure(log) ] }
+
+    emit:
+    results
+}
+
+workflow MITOHIFI_STATS_CIRCULAR {
+    take:
+    cases   // [ label, contigs_stats ]
+
+    main:
+    // Groovy null does not survive the channel round-trip as a distinguishable value in
+    // the assertions, so map it to the literal 'null' string here. The distinction that
+    // matters is null-vs-false, and both are visible this way.
+    results = cases.map { label, stats ->
+        def v = mitohifiStatsCircular(stats)
+        [ label, v == null ? 'null' : v.toString() ]
+    }
+
+    emit:
+    results
+}
+
+workflow OATK_FALLBACK_ROUTING {
+    take:
+    cases   // [ label, gb, evidence, relevance ]
+
+    main:
+    results = cases.map { label, gb, evidence, relevance ->
+        [ label, oatkFallbackReason(gb, evidence, relevance, 13, 1.15) ]
+    }
+
+    emit:
+    results
+}
+
+workflow PREFER_RESEED {
+    take:
+    cases   // [ label, rs_fasta, rs_log, fp_fasta, fp_log, tolerance ]
+
+    main:
+    results = cases.map { label, rs_fasta, rs_log, fp_fasta, fp_log, tolerance ->
+        [ label, preferReseed(rs_fasta, rs_log, fp_fasta, fp_log, tolerance as double,
+                              params.min_circular_mito_bp as int).toString() ]
+    }
+
+    emit:
+    results
+}
+
+workflow UPLOAD_SELECTION {
+    take:
+    variant_inputs // [ variant_prefix(identity), meta(+mt_assembly_run_prefix), fasta, log ]
+    checked_circ   // [ mt_assembly_run_prefix, checked_identity, verdict ]
+
+    main:
+    results = selectProvenanceVariants(variant_inputs, checked_circ)
+
+    emit:
+    results
+}
+
+workflow {
+    if (params.scenario == 'upload_selection') {
+        // meta.mt_assembly_run_prefix is the LINEAGE key, identical on every variant row; each
+        // variant's own identity is the key (the FASTA basename).
+        variants = Channel.of(
+            ['OG1.getorg1770',          [id: 'OG1', mt_assembly_run_prefix: 'OG1.getorg1770'], 'raw-first.fa',  'first.log'],
+            ['OG1.getorg1770reseed',    [id: 'OG1', mt_assembly_run_prefix: 'OG1.getorg1770'], 'raw-reseed.fa', 'reseed.log'],
+            ['OG1.getorg1770reseed_rgj',[id: 'OG1', mt_assembly_run_prefix: 'OG1.getorg1770'], 'raw-rgj.fa',    'rgj.log']
+        )
+        checked = Channel.of(
+            ['OG1.getorg1770', 'OG1.getorg1770reseed_rgj', true]
+        )
+        UPLOAD_SELECTION(variants, checked)
+        UPLOAD_SELECTION.out.results.view { meta, fasta, log ->
+            "RESULT\t${meta.mt_assembly_prefix}\t${fasta}\t${meta.circular}\t${log}"
+        }
+    } else {
+        def species = params.scenario ?: 'success'
+        REFERENCE_POLICY(Channel.value([
+            id: species,
+            species_id: species,
+            nominal_species_id: species,
+            mt_assembly_prefix: species
+        ]))
+        REFERENCE_POLICY.out.status.view { meta, status -> "STATUS\t${meta.id}\t${status.text.readLines()[1]}" }
+    }
+}

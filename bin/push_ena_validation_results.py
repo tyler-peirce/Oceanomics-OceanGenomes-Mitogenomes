@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Insert a normalized ENA validation result into PostgreSQL."""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import csv
+import sys
+from pathlib import Path
+from typing import Union
+
+try:
+    import psycopg2
+except ImportError:  # Allows unit tests to inject a connection factory.
+    psycopg2 = None
+
+
+INTEGER_COLUMNS = {
+    "reject_count", "error_count", "warning_count", "info_count",
+    "fatal_discrepancy_count", "nostop_count", "conversion_exit",
+    "preflight_exit", "webin_exit",
+}
+
+# Same order as RECORD_COLUMNS in collate_ena_validation.py, so the two lists
+# can be diffed against each other when a column is added or removed.
+INSERT_COLUMNS = [
+    "full_seqid", "og_id", "tech", "seq_date", "code", "annotation", "ena_study",
+    "validation_mode", "validation_attempt", "table2asn_status",
+    "reject_count", "error_count", "warning_count", "info_count",
+    "fatal_discrepancy_count", "nostop_count", "blocking_codes", "warning_codes",
+    "conversion_status", "conversion_reason", "conversion_exit",
+    "preflight_status", "preflight_reason", "preflight_exit",
+    "webin_status", "webin_reason", "webin_exit", "submission_ready",
+]
+
+
+def load_db_config(path: Union[str, Path]) -> dict[str, object]:
+    parser = configparser.ConfigParser()
+    if not parser.read(path) or not parser.has_section("postgres"):
+        raise ValueError(f"Missing [postgres] configuration in {path}")
+    required = ["dbname", "user", "password", "host", "port"]
+    missing = [key for key in required if not parser.has_option("postgres", key)]
+    if missing:
+        raise ValueError(f"Missing PostgreSQL settings: {', '.join(missing)}")
+    return {
+        "dbname": parser.get("postgres", "dbname"),
+        "user": parser.get("postgres", "user"),
+        "password": parser.get("postgres", "password"),
+        "host": parser.get("postgres", "host"),
+        "port": parser.getint("postgres", "port"),
+    }
+
+
+def read_record(path: Union[str, Path]) -> dict[str, object]:
+    with Path(path).open(newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    if len(rows) != 1:
+        raise ValueError(f"Expected exactly one ENA validation row in {path}")
+    missing = [column for column in INSERT_COLUMNS if column not in rows[0]]
+    if missing:
+        raise ValueError(f"Missing ENA validation columns: {', '.join(missing)}")
+    record: dict[str, object] = {}
+    for column in INSERT_COLUMNS:
+        value = (rows[0].get(column) or "").strip()
+        if column in INTEGER_COLUMNS:
+            record[column] = int(value) if value else None
+        elif column == "submission_ready":
+            record[column] = value.lower() in {"true", "1", "yes"}
+        elif column == "ena_study":
+            record[column] = value
+        else:
+            record[column] = value or None
+    for required in ("full_seqid", "og_id", "validation_mode", "validation_attempt",
+                     "table2asn_status", "conversion_status", "preflight_status",
+                     "webin_status"):
+        if record.get(required) is None:
+            raise ValueError(f"Required ENA validation value is empty: {required}")
+    return record
+
+
+KEY_COLUMNS = {"full_seqid", "ena_study", "validation_attempt"}
+
+
+def upload_record(record: dict[str, object], db_config: dict[str, object], connect=None) -> str:
+    """Insert or overwrite the row for this (full_seqid, ena_study, validation_attempt).
+
+    A rerun under the same key overwrites the previous attempt so failed
+    attempts don't pile up history rows. The key carries the annotation version,
+    so re-annotating an assembly writes a new row instead of overwriting the
+    record for the annotation that was validated before. Nothing freezes a row:
+    submission is a separate pipeline that owns its own state, so the latest
+    validation of a sequence is always the one recorded here.
+
+    Returns "inserted" (first row for this key) or "updated" (overwrote an
+    earlier attempt).
+    """
+    connect = connect or (psycopg2.connect if psycopg2 is not None else None)
+    if connect is None:
+        raise RuntimeError("psycopg2 is required for PostgreSQL upload")
+    update_columns = [column for column in INSERT_COLUMNS if column not in KEY_COLUMNS]
+    set_clause = ", ".join(f"{column} = EXCLUDED.{column}" for column in update_columns)
+    placeholders = ", ".join(f"%({column})s" for column in INSERT_COLUMNS)
+    columns = ", ".join(INSERT_COLUMNS)
+    query = f"""
+        INSERT INTO ena_validation_attempts ({columns})
+        VALUES ({placeholders})
+        ON CONFLICT (full_seqid, ena_study, validation_attempt)
+        DO UPDATE SET
+            {set_clause},
+            recorded_at = CURRENT_TIMESTAMP,
+            attempt_count = ena_validation_attempts.attempt_count + 1
+        RETURNING id, (xmax = 0) AS inserted
+    """
+    connection = connect(**db_config)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(query, record)
+            row = cursor.fetchone()
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return "inserted" if row[1] else "updated"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("config_file")
+    parser.add_argument("validation_record")
+    args = parser.parse_args()
+    try:
+        record = read_record(args.validation_record)
+        result = upload_record(record, load_db_config(args.config_file))
+        if result == "inserted":
+            print(f"✅ Success: inserted ENA validation attempt for {record['full_seqid']}")
+        else:
+            print(
+                f"🔁 Updated ENA validation attempt for {record['full_seqid']} "
+                "(overwrote the previous attempt)"
+            )
+        return 0
+    except Exception as error:
+        print(f"❌ Database error: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

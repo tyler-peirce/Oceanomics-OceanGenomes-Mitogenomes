@@ -1,11 +1,9 @@
 #!/usr/bin/env nextflow
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    nf-core/oceangenomesmitogenomes
+    OceanOmics OceanGenomes Mitogenomes
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    Github : https://github.com/nf-core/oceangenomesmitogenomes
-    Website: https://nf-co.re/oceangenomesmitogenomes
-    Slack  : https://nfcore.slack.com/channels/oceangenomesmitogenomes
+    Github : https://github.com/Minderoo-OceanOmics-Centre-UWA/Oceanomics-OceanGenomes-Mitogenomes
 ----------------------------------------------------------------------------------------
 */
 
@@ -16,7 +14,7 @@
 */
 
 include { OCEANGENOMESMITOGENOMES } from './workflows/oceangenomesmitogenomes'
-include { PREPARE_SAMPLESHEET     } from './subworkflows/local/prepare_samplesheet'
+include { PREPARE_SAMPLESHEET     } from './subworkflows/local/prepare_samplesheet/main'
 include { PIPELINE_INITIALISATION } from './subworkflows/local/utils_nfcore_oceangenomesmitogenomes_pipeline'
 include { PIPELINE_COMPLETION     } from './subworkflows/local/utils_nfcore_oceangenomesmitogenomes_pipeline'
 
@@ -44,6 +42,8 @@ workflow NFCORE_OCEANGENOMESMITOGENOMES {
         getorg_input,    // tuple for getorganelle - tuple(meta, reads)
         mitohifi_input, // tuple for mitohifi - tuple(meta, reads)
         params.curated_blast_db,
+        params.nt_blast_db,
+        params.mitos_refdb,
         params.sql_config,
         params.organelle_type,
     )

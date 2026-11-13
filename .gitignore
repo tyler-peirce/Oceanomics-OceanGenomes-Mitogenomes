@@ -1,12 +1,23 @@
 .nextflow*
 work/
-data/
+# Anchored: a bare `data/` matches a directory named data at ANY depth, which
+# silently untracked every modules/local/*/tests/data fixture -- nine module test
+# suites that passed only on the working copy where the files happened to sit,
+# and failed on any fresh clone. This rule is for the repo-root data dir.
+/data/
 results/
 .DS_Store
 testing/
 testing*
 *.pyc
 null/
-
+run_*
 blast_dbs/
 taxonkit_dbs/
+
+# nf-test runtime
+.nf-test/
+.nf-test.log
+# nf-test writes a scratch workflow per test into the repo ROOT, named
+# .nf-test-<hash>.nf. Anchored so it cannot reach anything under tests/.
+/.nf-test-*.nf

@@ -1,0 +1,96 @@
+nextflow_workflow {
+
+    name "Test cohort-safe process failure policy"
+    script "./main.nf"
+    config "./nextflow.config"
+    workflow "SAMPLE_POLICY"
+
+    test("deterministic sample failure is ignored while other samples complete") {
+        when {
+            workflow {
+                """
+                input[0] = Channel.of(
+                    ['good', 'success'],
+                    ['bad', 'deterministic_failure']
+                )
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().size() == 1 },
+                // 2, not 1: every failure now gets one unconditional retry before it
+                // is ignored, because a lost sbatch acknowledgement is also exit 1.
+                { assert workflow.trace.failed().size() == 2 },
+                { assert workflow.out.results.size() == 1 }
+            )
+        }
+    }
+
+    test("lost sbatch acknowledgement is retried and recovered") {
+        // Regression test for the NOVA_260909_LA_mitogenomes-3 deadlock: 7 tasks that
+        // had actually succeeded were reported as exit 1 (a dropped sbatch reply),
+        // ignored at attempt 1, and their unbound outputs stranded every downstream
+        // aggregator. One unconditional retry is what recovers them.
+        when {
+            workflow {
+                """
+                input[0] = Channel.of(['ack', 'lost_ack'])
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.failed().size() == 1 },
+                { assert workflow.trace.succeeded().size() == 1 },
+                { assert workflow.out.results.size() == 1 }
+            )
+        }
+    }
+
+    test("transient sample failure retries and succeeds") {
+        when {
+            workflow {
+                """
+                input[0] = Channel.of(['retry', 'transient_then_success'])
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.failed().size() == 1 },
+                { assert workflow.trace.succeeded().size() == 1 },
+                { assert workflow.out.results.size() == 1 }
+            )
+        }
+    }
+
+    test("exhausted transient sample failure is ignored") {
+        when {
+            workflow {
+                """
+                input[0] = Channel.of(
+                    ['good', 'success'],
+                    ['exhausted', 'transient_failure']
+                )
+                """
+            }
+        }
+
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.failed().size() == 3 },
+                { assert workflow.trace.succeeded().size() == 1 },
+                { assert workflow.out.results.size() == 1 }
+            )
+        }
+    }
+
+}

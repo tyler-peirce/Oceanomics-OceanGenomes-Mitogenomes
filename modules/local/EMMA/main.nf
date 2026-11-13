@@ -13,15 +13,28 @@ process EMMA {
     tuple val(meta), path(fasta)
 
     output:
-    tuple val(meta), path("emma/cds/*CO1*.fa"),  emit: co1_sequences
-    tuple val(meta), path("emma/cds/*RNR1*.fa"),  emit: s12_sequences  
-    tuple val(meta), path("emma/cds/*RNR2*.fa"),  emit: s16_sequences
-    tuple val(meta), path("emma/*"), emit: results 
+    // Per-gene CDS outputs are optional: a partial/divergent mitogenome may not
+    // yield every gene. Without optional, a missing CO1/RNR1/RNR2 turns a
+    // successful annotation into a failed task and the sample is dropped.
+    tuple val(meta), path("annotation/cds/*CO1*.fa"),  emit: co1_sequences, optional: true
+    tuple val(meta), path("annotation/cds/*RNR1*.fa"),  emit: s12_sequences, optional: true
+    tuple val(meta), path("annotation/cds/*RNR2*.fa"),  emit: s16_sequences, optional: true
+    tuple val(meta), path("annotation/*"), emit: results
+    tuple val(meta), path("07_emma.tool_params_mqcrow.html"), emit: tool_params
     path "versions_emma.yml", emit: versions
 
     script:
-        def args   = task.ext.args ?: ''
+        def base_args = (task.ext.args ?: '').toString().trim()
+        def inv_flag  = (meta.invertebrates ? '--invertebrates' : '')
+        def args      = [base_args, inv_flag].findAll{ it }.join(' ')
         def prefix = task.ext.prefix ?: meta.mt_assembly_prefix
+        // EMMA hard-codes Is_circular=true on the GFF region line regardless of the
+        // assembly. Rewrite it to false only when the assembler reported a
+        // non-circular genome (meta.circular == false; set by GetOrganelle).
+        // Unknown topology (e.g. MitoHiFi, which leaves meta.circular unset) keeps
+        // EMMA's default so we never assert false without evidence.
+        def emma_noncircular = (meta.circular == false)
+        def effective_args = [args, "--fa annotation/<prefix>.fa", "--gff annotation/<prefix>.gff", "--tbl annotation/<prefix>.tbl", "--svg annotation/<prefix>.svg", "--tempdir tempdir/", "--loglevel debug", fasta].findAll { it?.toString()?.trim() }.join(' ')
 
         """
             # Explicitly export the environment variable (double protection)
@@ -31,33 +44,47 @@ process EMMA {
                      
             emma_prefix="${prefix}.emma"\${emma_version}""
             
-            mkdir -p tempdir cds emma
+            mkdir -p tempdir cds annotation
             
             julia --project=/opt/Emma /opt/Emma/src/command.jl \\
                 $args \\
-                --fa emma/\${emma_prefix}.fa \\
-                --gff emma/\${emma_prefix}.gff \\
-                --tbl emma/\${emma_prefix}.tbl \\
-                --svg emma/\${emma_prefix}.svg \\
+                --fa annotation/\${emma_prefix}.fa \\
+                --gff annotation/\${emma_prefix}.gff \\
+                --tbl annotation/\${emma_prefix}.tbl \\
+                --svg annotation/\${emma_prefix}.svg \\
                 --tempdir tempdir/ \\
                 --loglevel debug \\
-                ${fasta} 
+                ${fasta}
+
+            # Correct the GFF topology flag when the assembly is known non-circular.
+            # NB: `sed -i` does not preserve permissions on the Lustre scratch
+            # filesystem (the rewritten file lands at mode 000 inside the
+            # container), which makes the downstream extract_proteins.jl step
+            # fail with "Permission denied". Restore readable perms afterwards.
+            if ${emma_noncircular ? 'true' : 'false'}; then
+                sed -i 's/Is_circular=true/Is_circular=false/' annotation/\${emma_prefix}.gff
+                chmod 644 annotation/\${emma_prefix}.gff
+            fi
+
+            cat <<-END_TOOL_PARAMS > 07_emma.tool_params_mqcrow.html
+            <tr><td>EMMA</td><td><samp>${effective_args}</samp></td><td>Annotates the mitogenome assembly for ${meta.id}; adds --invertebrates when the sample metadata requires it.</td></tr>
+            END_TOOL_PARAMS
             
             julia /opt/extract_proteins.jl \\
-                emma/ \\
-                emma/
+                annotation/ \\
+                annotation/
             
-            mv cds emma/
-            mv proteins emma/  
+            mv cds annotation/
+            mv proteins annotation/  
             
             # Add in the sample to the file names in cds
-            for file in emma/cds/*; do
+            for file in annotation/cds/*; do
                 new_file="\${file%.fa}.\${emma_prefix}.fa"     
                 mv "\$file" "\$new_file"
             done
 
             # Add in the sample to the file names in cds
-            for file in emma/proteins/*; do
+            for file in annotation/proteins/*; do
                 new_file="\${file%.fa}.\${emma_prefix}.fa"     
                 mv "\$file" "\$new_file"
             done
@@ -72,6 +99,10 @@ process EMMA {
 
  stub:
     def prefix = task.ext.prefix ?: "${meta.mt_assembly_prefix}"
+    def base_args = (task.ext.args ?: '').toString().trim()
+    def inv_flag  = (meta.invertebrates ? '--invertebrates' : '')
+    def args      = [base_args, inv_flag].findAll{ it }.join(' ')
+    def effective_args = [args, "--fa annotation/<prefix>.fa", "--gff annotation/<prefix>.gff", "--tbl annotation/<prefix>.tbl", "--svg annotation/<prefix>.svg", "--tempdir tempdir/", "--loglevel debug", fasta].findAll { it?.toString()?.trim() }.join(' ')
     
         """
         # Create mock emma version for stub
@@ -79,18 +110,22 @@ process EMMA {
         emma_prefix="${prefix}.emma\${emma_version}"
         
         # Create directory structure
-        mkdir -p emma/cds
+        mkdir -p annotation/cds
         
         # Create mock output files
-        touch emma/\${emma_prefix}.fa
-        touch emma/\${emma_prefix}.gff
-        touch emma/\${emma_prefix}.tbl
-        touch emma/\${emma_prefix}.svg
+        touch annotation/\${emma_prefix}.fa
+        touch annotation/\${emma_prefix}.gff
+        touch annotation/\${emma_prefix}.tbl
+        touch annotation/\${emma_prefix}.svg
         
         # Create mock CDS files
-        touch emma/cds/CO1_gene.\${emma_prefix}.fa
-        touch emma/cds/RNR1_gene.\${emma_prefix}.fa
-        touch emma/cds/RNR2_gene.\${emma_prefix}.fa
+        touch annotation/cds/CO1_gene.\${emma_prefix}.fa
+        touch annotation/cds/RNR1_gene.\${emma_prefix}.fa
+        touch annotation/cds/RNR2_gene.\${emma_prefix}.fa
+
+        cat <<-END_TOOL_PARAMS > 07_emma.tool_params_mqcrow.html
+        <tr><td>EMMA</td><td><samp>${effective_args}</samp></td><td>Annotates the mitogenome assembly for ${meta.id}; adds --invertebrates when the sample metadata requires it.</td></tr>
+        END_TOOL_PARAMS
         
         # Create mock versions file
         cat <<-END_VERSIONS > versions_emma.yml

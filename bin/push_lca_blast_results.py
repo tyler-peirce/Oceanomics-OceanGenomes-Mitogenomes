@@ -3,9 +3,12 @@
 import psycopg2
 import pandas as pd
 import numpy as np
+import argparse
 import configparser
 import sys
 from pathlib import Path
+
+from pg_row_guard import row_savepoint
 
 def load_db_config(config_file):
     if not Path(config_file).exists():
@@ -39,12 +42,21 @@ blast_column_headers = [
 ]
 
 def process_blast(blast_file, sample, db_params):
+    """Upload one sample's filtered BLAST hits. Returns the number of failed rows."""
     print(f"📂 Reading BLAST file: {blast_file}")
     df = pd.read_csv(blast_file, sep='\t', header=None, names=blast_column_headers).replace({np.nan: None})
 
     if 'query_id' not in df.columns:
         print("❌ Missing 'query_id' in BLAST file")
-        return
+        return 1
+
+    # A sample whose regions produced no filtered hits gets an empty combined file. Splitting
+    # query_id on an empty frame yields a 0-column result and raises "Columns must be same
+    # length as key", which under errorStrategy 'ignore' silently dropped the sample's whole
+    # BLAST upload. No hits is a legitimate outcome, not an error.
+    if df.empty:
+        print(f"ℹ️  No filtered BLAST hits for {sample} — nothing to upload")
+        return 0
 
     df[['og_id', 'tech', 'seq_date', 'code', 'annotation']] = df['query_id'].str.split('.', expand=True)
 
@@ -54,22 +66,25 @@ def process_blast(blast_file, sample, db_params):
         cursor = conn.cursor()
         for _, row in df.iterrows():
             row_dict = row.to_dict()
+            # mito_blast_hit is keyed by annotation_id (genomes_db_review 076, Phase R.7b);
+            # mito_annotation_id() resolves it from the query_id parts and refuses a hit
+            # for an annotation the database does not hold.
             upsert_query = """
-            INSERT INTO blast_filtered_lca (
-                og_id, tech, seq_date, code, annotation, match_sequence_id, taxon_id,
+            INSERT INTO mito_blast_hit (
+                annotation_id, match_sequence_id, taxon_id,
                 scientific_name, common_name, kingdoms, percent_identity, alignment_length,
                 query_length, subject_length, mismatch, gap_open, gaps, query_start,
                 query_end, subject_start, subject_end, subject_title, evalue, bit_score,
                 query_coverage, subject_coverage, region, blast_run_date
             )
             VALUES (
-                %(og_id)s, %(tech)s, %(seq_date)s, %(code)s, %(annotation)s, %(match_sequence_id)s, %(taxon_id)s,
+                mito_annotation_id(%(og_id)s, %(tech)s, %(seq_date)s, %(code)s, %(annotation)s), %(match_sequence_id)s, %(taxon_id)s,
                 %(scientific_name)s, %(common_name)s, %(kingdoms)s, %(percent_identity)s, %(alignment_length)s,
                 %(query_length)s, %(subject_length)s, %(mismatch)s, %(gap_open)s, %(gaps)s, %(query_start)s,
                 %(query_end)s, %(subject_start)s, %(subject_end)s, %(subject_title)s, %(evalue)s, %(bit_score)s,
                 %(query_coverage)s, %(subject_coverage)s, %(region)s, %(blast_run_date)s
             )
-            ON CONFLICT (og_id, tech, seq_date, code, annotation, match_sequence_id, region)
+            ON CONFLICT (annotation_id, match_sequence_id, region)
             DO UPDATE SET
                 blast_run_date = EXCLUDED.blast_run_date,
                 taxon_id = EXCLUDED.taxon_id,
@@ -125,95 +140,261 @@ def process_blast(blast_file, sample, db_params):
             }
 
             try:
-                cursor.execute(upsert_query, params)
+                with row_savepoint(cursor):
+                    cursor.execute(upsert_query, params)
                 success += 1
             except Exception as e:
                 failure += 1
                 print(f"❌ BLAST row failed ({row_dict.get('query_id')}): {e}")
 
-    print(f"✅ BLAST upload complete: {success} rows succeeded, {failure} failed")
+    # Printed only after the `with` block has committed, so the tally describes
+    # rows that are actually in the table rather than rows that were attempted.
+    if failure:
+        print(f"⚠️ BLAST upload finished with errors: {success} rows succeeded, {failure} failed")
+    else:
+        print(f"✅ BLAST upload complete: {success} rows succeeded, {failure} failed")
+    return failure
 
 
 lca_column_headers = [
-    "query_id", "taxonomy", "lca", "percent_match",
-    "length", "lca_run_date", "region"
+    "seq_id", "species_in_LCA", "numberOfUnq_BlastHits", "domain",
+    "phylum", "class", "order", "family", "genus", "specificEpithet",
+    "scientificName", "scientificNameAuthorship", "taxonRank", "top_taxonID",
+    "taxonID_db", "top_verbatimIdentification", "top_accession_id", "accession_id_ref_db",
+    "taxonRank_db",
+    "top_percent_match", "top_percent_query_cover", "top_percent_query_cover_hsp", "alignment_length",
+    "subject_length", "sequence_length", "top_confidence_score", "sequence_region", "lca_run_date",
+    "dna_sequence", "identificationRemarks"
 ]
 
-def process_lca(lca_file, sample, db_params):
+# The group --prune-history prunes: everything this sample/region has ever recorded.
+LCA_HISTORY_KEY = ["og_id", "tech", "seq_date", "code", "annotation", "region"]
+
+
+def prune_superseded_lca(cursor, written):
+    """Delete lca rows this run did not produce, per sample/region it touched.
+
+    `written` maps an LCA_HISTORY_KEY tuple to the set of lca_run_date values this
+    run wrote for it. A row whose content matched has just had its date refreshed
+    to the current run's, so anything left on another date is a superseded result.
+    """
+    # mito_lca is keyed by annotation_id (076); the history key's first five parts resolve to it.
+    query = (
+        "DELETE FROM mito_lca "
+        "WHERE annotation_id = mito_annotation_id(%s, %s, %s, %s, %s, false) "
+        'AND "region" = %s AND "lca_run_date"::text <> ALL(%s)'
+    )
+    deleted = 0
+    for key, run_dates in written.items():
+        cursor.execute(query, list(key) + [[str(d) for d in run_dates]])
+        deleted += cursor.rowcount
+    return deleted
+
+
+def process_lca(lca_file, sample, db_params, prune_history=False):
+    """Upload one sample's LCA assignments. Returns the number of failed rows."""
     print(f"📂 Reading LCA file: {lca_file}")
-    df = pd.read_csv(lca_file, sep='\t', header=None, names=lca_column_headers).replace({np.nan: None})
+    # df = pd.read_csv(lca_file, sep='\t', header=True, names=lca_column_headers).replace({np.nan: None})
+    # header=0 means a 0-byte file raises EmptyDataError rather than parsing to an empty
+    # frame (process_blast passes explicit names, so it does not). Both mean the same thing
+    # here -- nothing to upload -- so treat them the same instead of failing the task.
+    try:
+        df = pd.read_csv(lca_file, sep='\t', header=0).replace({np.nan: None})
+    except pd.errors.EmptyDataError:
+        print(f"ℹ️  Empty LCA file for {sample} — nothing to upload")
+        return 0
 
-    if 'query_id' not in df.columns:
-        print("❌ Missing 'query_id' in LCA file")
-        return
+    if 'seq_id' not in df.columns:
+        print("❌ Missing 'seq_id' in LCA file")
+        return 1
 
-    df[['og_id', 'tech', 'seq_date', 'code', 'annotation']] = df['query_id'].str.split('.', expand=True)
+    # Same as process_blast: a header-only combined file is "no assignments", not a failure.
+    if df.empty:
+        print(f"ℹ️  No LCA assignments for {sample} — nothing to upload")
+        return 0
+
+    df[['og_id', 'tech', 'seq_date', 'code', 'annotation']] = df['seq_id'].str.split('.', expand=True)
     success, failure = 0, 0
-    
+    # HISTORY_KEY tuple -> set of lca_run_date values written for it, used by --prune-history.
+    written = {}
+
     with psycopg2.connect(**db_params) as conn:
         cursor = conn.cursor()
         for _, row in df.iterrows():
             row_dict = row.to_dict()
             upsert_query = """
-            INSERT INTO lca (
-                og_id, tech, seq_date, code, annotation, taxonomy, lca, percent_match,
-                length, lca_run_date, region
+            INSERT INTO mito_lca (
+                annotation_id,
+                region,
+                lca_run_date,
+                species_in_lca,
+                number_unq_blast_hits,
+                domain,
+                phylum,
+                class,
+                "order",
+                family,
+                genus,
+                specific_epiphet,
+                species,
+                scientific_name_authorship,
+                taxon_rank,
+                top_taxon_id,
+                taxon_id_db,
+                top_accession_id,
+                accession_id_ref_db,
+                taxon_rank_db,
+                top_percent_match,
+                top_percent_query_cover,
+                top_percent_query_cover_hsp,
+                alignment_length,
+                subject_length,
+                sequence_length,
+                top_confidence_score
             )
             VALUES (
-                %(og_id)s, %(tech)s, %(seq_date)s, %(code)s, %(annotation)s, %(taxonomy)s, %(lca)s,
-                %(percent_match)s, %(length)s, %(lca_run_date)s, %(region)s
+                mito_annotation_id(%(og_id)s, %(tech)s, %(seq_date)s, %(code)s, %(annotation)s),
+                %(region)s,
+                %(lca_run_date)s,
+                %(species_in_lca)s,
+                %(number_unq_blast_hits)s,
+                %(domain)s,
+                %(phylum)s,
+                %(class)s,
+                %(order)s,
+                %(family)s,
+                %(genus)s,
+                %(specific_epiphet)s,
+                %(species)s,
+                %(scientific_name_authorship)s,
+                %(taxon_rank)s,
+                %(top_taxon_id)s,
+                %(taxon_id_db)s,
+                %(top_accession_id)s,
+                %(accession_id_ref_db)s,
+                %(taxon_rank_db)s,
+                %(top_percent_match)s,
+                %(top_percent_query_cover)s,
+                %(top_percent_query_cover_hsp)s,
+                %(alignment_length)s,
+                %(subject_length)s,
+                %(sequence_length)s,
+                %(top_confidence_score)s
             )
-            ON CONFLICT (og_id, tech, seq_date, code, annotation, region, lca_run_date)
+            -- Rows are keyed by content (content_hash is set by the
+            -- lca_content_hash trigger), so a conflict means this run reproduced
+            -- an existing result exactly. The only thing left to record is that
+            -- it was seen again; a differing result hashes differently and is
+            -- inserted as a new row rather than overwriting the old one.
+            -- mito_lca is keyed by annotation_id (genomes_db_review 076, Phase R.7b), resolved
+            -- by mito_annotation_id(). BEFORE INSERT triggers run before the conflict check,
+            -- so content_hash is set when the target is matched.
+            ON CONFLICT (annotation_id, region, content_hash)
             DO UPDATE SET
-                taxonomy = EXCLUDED.taxonomy,
-                lca = EXCLUDED.lca,
-                percent_match = EXCLUDED.percent_match,
-                length = EXCLUDED.length,
                 lca_run_date = EXCLUDED.lca_run_date;
             """
-            
+
+            # params: 1:1 mapping between placeholders and df column names
             params = {
-                "og_id": row_dict["og_id"],
-                "tech": row_dict["tech"],
-                "seq_date": row_dict["seq_date"],
-                "code": row_dict["code"],
-                "annotation": row_dict["annotation"],
-                "taxonomy": row_dict.get("taxonomy"),
-                "lca": row_dict.get("lca"),
-                "percent_match": row_dict.get("percent_match"),
-                "length": row_dict.get("length"),
+                "og_id": row_dict.get("og_id"),
+                "tech": row_dict.get("tech"),
+                "seq_date": row_dict.get("seq_date"),
+                "code": row_dict.get("code"),
+                "annotation": row_dict.get("annotation"),
+                "region": row_dict.get("sequence_region"),
                 "lca_run_date": row_dict.get("lca_run_date"),
-                "region": row_dict["region"]
+
+                "species_in_lca": row_dict.get("species_in_LCA"),
+                "number_unq_blast_hits": row_dict.get("numberOfUnq_BlastHits"),
+                "domain": row_dict.get("domain"),
+                "phylum": row_dict.get("phylum"),
+                "class": row_dict.get("class"),
+                "order": row_dict.get("order"),
+                "family": row_dict.get("family"),
+                "genus": row_dict.get("genus"),
+
+                "specific_epiphet": row_dict.get("specificEpithet"),
+                "species": row_dict.get("scientificName"),
+                "scientific_name_authorship": row_dict.get("scientificNameAuthorship"),
+                "taxon_rank": row_dict.get("taxonRank"),
+
+                "top_taxon_id": row_dict.get("top_taxonID"),
+                "taxon_id_db": row_dict.get("taxonID_db"),
+                "top_accession_id": row_dict.get("top_accession_id"),
+                "accession_id_ref_db": row_dict.get("accession_id_ref_db"),
+                "taxon_rank_db": row_dict.get("taxonRank_db"),
+                "top_percent_match": row_dict.get("top_percent_match"),
+                "top_percent_query_cover": row_dict.get("top_percent_query_cover"),
+                "top_percent_query_cover_hsp": row_dict.get("top_percent_query_cover_hsp"),
+
+                "alignment_length": row_dict.get("alignment_length"),
+                "subject_length": row_dict.get("subject_length"),
+                "sequence_length": row_dict.get("sequence_length"),
+                "top_confidence_score": row_dict.get("top_confidence_score"),
             }
 
-            check = """
-            SELECT * FROM mitogenome_data
-                WHERE og_id = 'OG0'
-                AND tech = 'ilmn'
-                AND seq_date = '00'
-                AND code = 'getorg1770';
-            """
             try:
-                cursor.execute(upsert_query, params)
+                with row_savepoint(cursor):
+                    cursor.execute(upsert_query, params)
                 success += 1
+                key = tuple(params[c] for c in LCA_HISTORY_KEY)
+                written.setdefault(key, set()).add(params["lca_run_date"])
             except Exception as e:
                 failure += 1
-                print(f"❌ LCA row failed ({row_dict.get('query_id')}): {e}")
-    
-    print(f"✅ LCA upload complete: {success} rows succeeded, {failure} failed")
+                print(f"❌ LCA row failed ({row_dict.get('seq_id')}): {e}")
+
+        # Prune only after every row landed: deleting around a failure could drop
+        # the older result without its replacement having been written.
+        if prune_history and failure == 0:
+            pruned = prune_superseded_lca(cursor, written)
+            print(f"🧹 --prune-history: deleted {pruned} superseded lca rows")
+        elif prune_history:
+            print("⚠️ Skipping --prune-history prune: upload had failures.")
+
+    if failure:
+        print(f"⚠️ LCA upload finished with errors: {success} rows succeeded, {failure} failed")
+    else:
+        print(f"✅ LCA upload complete: {success} rows succeeded, {failure} failed")
+    return failure
 
 if __name__ == "__main__":
-    if len(sys.argv) != 5:
-        print("Usage:\n  push_lca_blast_results.py <config_file> <sample> <lca_results> <blast_results>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Upload filtered BLAST hits and LCA assignments for one sample."
+    )
+    parser.add_argument(
+        "--prune-history",
+        "--force",
+        action="store_true",
+        dest="prune_history",
+        help=(
+            "After uploading, delete lca rows for the same sample/region that this "
+            "run did not produce, so only the current result is kept. Off by "
+            "default: superseded results are preserved alongside the new ones, and "
+            "the content-keyed upsert already makes a re-run correct without it. "
+            "Does not affect blast_filtered_lca, which overwrites in place and "
+            "keeps no history. '--force' is a deprecated alias."
+        ),
+    )
+    parser.add_argument("config_file")
+    parser.add_argument("sample")
+    parser.add_argument("lca_results")
+    parser.add_argument("blast_results")
+    args = parser.parse_args()
 
-    config_path, sample_id, lca_path, blast_path = sys.argv[1:5]
-    db_config = load_db_config(config_path)
+    db_config = load_db_config(args.config_file)
 
     print("\n🔄 Starting BLAST processing...")
-    process_blast(blast_path, sample_id, db_config)
+    failed = process_blast(args.blast_results, args.sample, db_config)
 
     print("\n🔄 Starting LCA processing...")
-    process_lca(lca_path, sample_id, db_config)
+    failed += process_lca(
+        args.lca_results, args.sample, db_config, prune_history=args.prune_history
+    )
+
+    # Exit non-zero so Nextflow surfaces a partial upload instead of publishing a
+    # green task whose log quietly reports missing rows.
+    if failed:
+        print(f"\n❌ {failed} row(s) failed to upload for {args.sample}.")
+        sys.exit(1)
 
     print("\n🎉 All processing complete.")

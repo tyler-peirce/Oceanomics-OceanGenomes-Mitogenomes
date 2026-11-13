@@ -1,6 +1,6 @@
 process PUSH_LCA_BLAST_RESULTS {
     tag "$meta.id"
-    label 'process_medium'
+    label 'process_upload'
     container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
         'docker://tylerpeirce/psycopg2:0.1' :
         'tylerpeirce/psycopg2:0.1' }"
@@ -10,18 +10,27 @@ process PUSH_LCA_BLAST_RESULTS {
     path config
 
     output:
-    path "${meta.id}.lca_blast.upload.txt", emit: upload
+    path "${meta.mt_assembly_prefix ?: meta.id}.lca_blast.upload.txt", emit: upload
+    tuple val(meta), path("13_push_lca_blast_results.tool_params_mqcrow.html"), emit: tool_params
     path "versions.yml"                   , emit: versions
 
     script:
+    def args = task.ext.args ?: ''
+    def mt_assembly_prefix = meta.mt_assembly_prefix ?: meta.id
+    def effective_args = [args, config, meta.id, lca_results, blast_results].findAll { it?.toString()?.trim() }.join(' ')
     """
     # Push the results to SQL database
     push_lca_blast_results.py \\
+        $args \\
         $config \\
         ${meta.id} \\
         ${lca_results} \\
         ${blast_results} \\
-        > ${meta.id}.lca_blast.upload.txt
+        > ${mt_assembly_prefix}.lca_blast.upload.txt
+
+    cat <<-END_TOOL_PARAMS > 13_push_lca_blast_results.tool_params_mqcrow.html
+    <tr><td>Push LCA BLAST Results</td><td><samp>${effective_args}</samp></td><td>Uploads combined LCA and filtered BLAST results for ${meta.id}.</td></tr>
+    END_TOOL_PARAMS
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
@@ -30,8 +39,14 @@ process PUSH_LCA_BLAST_RESULTS {
     """
     
     stub:
+    def args = task.ext.args ?: ''
+    def mt_assembly_prefix = meta.mt_assembly_prefix ?: meta.id
+    def effective_args = [args, config, meta.id, lca_results, blast_results].findAll { it?.toString()?.trim() }.join(' ')
     """
-    : > ${meta.id}.lca_blast.upload.txt
+    : > ${mt_assembly_prefix}.lca_blast.upload.txt
+    cat <<-END_TOOL_PARAMS > 13_push_lca_blast_results.tool_params_mqcrow.html
+    <tr><td>Push LCA BLAST Results</td><td><samp>${effective_args}</samp></td><td>Uploads combined LCA and filtered BLAST results for ${meta.id}.</td></tr>
+    END_TOOL_PARAMS
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
         upload: "stub"

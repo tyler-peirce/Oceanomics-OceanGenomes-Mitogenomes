@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Normalize ENA submission-gate outputs and compile batch summaries."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from assembly_variant import is_rescue_molecule
+
+
+RECORD_COLUMNS = [
+    "full_seqid", "og_id", "tech", "seq_date", "code", "annotation",
+    "ena_study", "validation_mode", "validation_attempt",
+    "table2asn_status", "reject_count", "error_count", "warning_count",
+    "info_count", "fatal_discrepancy_count", "nostop_count",
+    "blocking_codes", "warning_codes",
+    "conversion_status", "conversion_reason", "conversion_exit",
+    "preflight_status", "preflight_reason", "preflight_exit",
+    "webin_status", "webin_reason", "webin_exit", "submission_ready",
+]
+
+MQC_COLUMNS = [
+    "full_seqid", "og_id", "annotation", "validation_mode", "ena_study",
+    "table2asn_status", "conversion_status", "preflight_status",
+    "webin_status", "webin_reason", "submission_ready",
+    "validation_attempt",
+]
+
+
+def read_tsv_row(path: Path) -> dict[str, str]:
+    try:
+        with path.open(newline="") as handle:
+            rows = list(csv.DictReader(handle, delimiter="\t"))
+    except (OSError, csv.Error):
+        return {}
+    if not rows:
+        return {}
+    return {str(key): "" if value is None else str(value).strip() for key, value in rows[0].items()}
+
+
+def read_status(path: Path) -> dict[str, str]:
+    row = read_tsv_row(path)
+    if not row.get("status"):
+        return {"status": "MALFORMED_STATUS", "reason": "missing_status_row"}
+    return row
+
+
+def identity_from_seqid(full_seqid: str, og_id: str) -> tuple[str, str, str, str, str]:
+    """Split OG82.ilmn.240313.getorg1770.emma102 into its five identity fields.
+
+    The annotation version is the fifth field.  A four-field id (the standalone
+    ena.nf entry point can be handed an assembly prefix with no annotation)
+    yields an empty annotation rather than folding the annotation into code.
+    """
+    parts = full_seqid.split(".", 4)
+    inferred_og = parts[0] if parts and parts[0] else og_id
+    tech = parts[1] if len(parts) > 1 else ""
+    seq_date = parts[2] if len(parts) > 2 else ""
+    code = parts[3] if len(parts) > 3 else ""
+    annotation = parts[4] if len(parts) > 4 else ""
+    return inferred_og or og_id, tech, seq_date, code, annotation
+
+
+def _first(paths: list[Path], suffix: str) -> Path | None:
+    return next((path for path in paths if path.name.endswith(suffix)), None)
+
+
+def build_record(
+    input_paths: list[Path], *, full_seqid: str, og_id: str,
+    ena_study: str, validation_mode: str, validation_attempt: str,
+    webin_requested: bool,
+) -> dict[str, str]:
+    table_path = _first(input_paths, ".table2asn_status.tsv")
+    conversion_path = _first(input_paths, ".ena_conversion_status.tsv")
+    preflight_path = _first(input_paths, ".ena_preflight_status.tsv")
+    preflight_check_path = _first(input_paths, ".ena_preflight_check.tsv")
+    webin_path = _first(input_paths, ".webin_status.tsv")
+
+    table = read_status(table_path) if table_path else {}
+    conversion = read_status(conversion_path) if conversion_path else {}
+    preflight = read_status(preflight_path) if preflight_path else {}
+    preflight_check = read_tsv_row(preflight_check_path) if preflight_check_path else {}
+    webin = read_status(webin_path) if webin_path else {}
+
+    if validation_mode == "validate":
+        table_status = "NOT_APPLICABLE"
+        conversion_status = "NOT_APPLICABLE"
+        preflight_status = preflight.get("status", "NOT_RUN")
+        webin_status = webin.get("status", "NOT_RUN")
+    else:
+        table_status = table.get("status", "MALFORMED_STATUS")
+        conversion_status = conversion.get(
+            "status", "NOT_RUN" if table_status == "PASS" else "SKIPPED_TABLE2ASN"
+        )
+        preflight_status = "NOT_APPLICABLE"
+        if not webin_requested:
+            webin_status = "NOT_REQUESTED"
+        else:
+            webin_status = webin.get("status", "NOT_RUN")
+
+    if validation_mode == "validate" and not webin_requested:
+        webin_status = "NOT_REQUESTED"
+
+    if conversion:
+        conversion_reason = conversion.get("reason", "unspecified")
+    elif validation_mode == "validate":
+        conversion_reason = "not_applicable"
+    elif table_status != "PASS":
+        conversion_reason = "table2asn_blocked"
+    else:
+        conversion_reason = "not_run"
+
+    if webin:
+        webin_reason = webin.get("reason", "unspecified")
+    elif not webin_requested:
+        webin_reason = "not_requested"
+    elif ((validation_mode == "validate" and preflight_status != "PASS") or
+          (validation_mode != "validate" and conversion_status != "PASS")):
+        webin_reason = "upstream_gate_not_passed"
+    else:
+        webin_reason = "not_run"
+
+    inferred_og, tech, seq_date, code, annotation = identity_from_seqid(full_seqid, og_id)
+    gates_pass = (
+        preflight_status == "PASS" if validation_mode == "validate"
+        else table_status == "PASS" and conversion_status == "PASS"
+    )
+    # The flatfile format check (WEBIN_VALIDATE, -context sequence) is this
+    # pipeline's last gate.  A flatfile that clears every gate is ready to hand
+    # to the submission pipeline; selecting and submitting it is that pipeline's
+    # job, not something this record waits on.  Without the format check there
+    # is no readiness claim to make, so --ena_webin_validate false stays false.
+    ready = "true" if gates_pass and webin_status == "PASS" else "false"
+
+    # An _rgj / _concat can never be submission_ready, whatever the gates say. It is a
+    # scaffolding artefact whose junctions are inferred, not a molecule anyone sequenced,
+    # and it exists only so a partial mitogenome can be annotated and get a species ID.
+    #
+    # Nothing used to distinguish it: the QC gate is content-based and readiness is pure gate
+    # arithmetic, so OG2936's _rgj reached submission_ready=true in NOVA_260909_LA. The webin
+    # call is guarded too (see subworkflows/local/ena_submission_prep), which alone keeps
+    # webin_status off PASS; this is the second lock, so a future entry point that reaches
+    # webin another way still cannot produce a readiness claim for an artificial molecule.
+    if is_rescue_molecule(code):
+        ready = "false"
+        webin_reason = "not_submittable:rescue_variant"
+
+    record = {column: "" for column in RECORD_COLUMNS}
+    record.update({
+        "full_seqid": full_seqid,
+        "og_id": inferred_og,
+        "tech": tech,
+        "seq_date": seq_date,
+        "code": code,
+        "annotation": annotation,
+        "ena_study": ena_study,
+        "validation_mode": validation_mode,
+        "validation_attempt": validation_attempt,
+        "table2asn_status": table_status,
+        "reject_count": table.get("reject_count", ""),
+        "error_count": table.get("error_count", ""),
+        "warning_count": table.get("warning_count", ""),
+        "info_count": table.get("info_count", ""),
+        "fatal_discrepancy_count": table.get("fatal_discrepancy_count", ""),
+        "nostop_count": table.get("nostop_count", ""),
+        "blocking_codes": table.get("blocking_codes", ""),
+        "warning_codes": table.get("warning_codes", ""),
+        "conversion_status": conversion_status,
+        "conversion_reason": conversion_reason,
+        "conversion_exit": conversion.get("seqret_exit", ""),
+        "preflight_status": preflight_status,
+        "preflight_reason": preflight.get("reason", "not_applicable" if validation_mode != "validate" else "not_run"),
+        "preflight_exit": preflight_check.get("gzip_exit", ""),
+        "webin_status": webin_status,
+        "webin_reason": webin_reason,
+        "webin_exit": webin.get("webin_exit", ""),
+        "submission_ready": ready,
+    })
+    return record
+
+
+def write_rows(path: Path, columns: list[str], rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in columns})
+
+
+def read_records(paths: list[Path]) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for path in paths:
+        with path.open(newline="") as handle:
+            records.extend(csv.DictReader(handle, delimiter="\t"))
+    return sorted(records, key=lambda row: (row.get("full_seqid", ""), row.get("validation_attempt", "")))
+
+
+def expand_patterns(patterns: list[str]) -> list[Path]:
+    return [Path(match) for pattern in patterns for match in glob.glob(pattern)]
+
+
+def command_record(args: argparse.Namespace) -> None:
+    paths = expand_patterns(args.input)
+    record = build_record(
+        paths,
+        full_seqid=args.full_seqid,
+        og_id=args.og_id,
+        ena_study=args.ena_study,
+        validation_mode=args.validation_mode,
+        validation_attempt=args.validation_attempt,
+        webin_requested=args.webin_requested,
+    )
+    write_rows(Path(args.output), RECORD_COLUMNS, [record])
+
+
+def command_summary(args: argparse.Namespace) -> None:
+    paths = expand_patterns(args.input)
+    rows = read_records(paths)
+    write_rows(Path(args.output), MQC_COLUMNS, rows)
+    if args.run_summary:
+        write_rows(Path(args.run_summary), MQC_COLUMNS, rows)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    record = subparsers.add_parser("record")
+    record.add_argument("--input", action="append", required=True)
+    record.add_argument("--output", required=True)
+    record.add_argument("--full-seqid", required=True)
+    record.add_argument("--og-id", required=True)
+    record.add_argument("--ena-study", default="")
+    record.add_argument("--validation-mode", required=True, choices=["pipeline", "convert_validate", "validate"])
+    record.add_argument("--validation-attempt", required=True)
+    record.add_argument("--webin-requested", action="store_true")
+    record.set_defaults(func=command_record)
+
+    summary = subparsers.add_parser("summary")
+    summary.add_argument("--input", action="append", required=True)
+    summary.add_argument("--output", required=True)
+    summary.add_argument("--run-summary")
+    summary.set_defaults(func=command_summary)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -15,10 +15,17 @@ import os
 import re
 import argparse
 import configparser
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 import psycopg2
+
+from geo_loc_name_utils import (
+    hemispheres_for_geo_loc_name,
+    resolve_geo_loc_name,
+    unmapped_warning,
+)
 
 # -------------------------------
 # Load DB credentials from .cfg
@@ -57,6 +64,12 @@ def parse_args():
     p.add_argument("--og-id", required=True, help="Sample OG_ID / isolate.")
     p.add_argument("--seq-tech", required=True, help="Sequencing tech (e.g., hifi, ilmn, hic).")
     p.add_argument("--assembly-id", required=True, help="Full name of assembly (e.g.OG00.ilmn.220022.getorg1770.emma102).")
+    p.add_argument(
+        "--full-seqid", required=True,
+        help="The SeqID this .src is for, from meta.full_seqid. The file is named from THIS "
+             "rather than from the database, because the pipeline already knows the answer and "
+             "the DB-derived form was the source of wrong-named files.",
+    )
     return p.parse_args()
 
 # ---------------------------
@@ -76,19 +89,43 @@ def _norm_quotes(s: str) -> str:
             .replace("O", "°")
             .strip())
 
-def parse_coordinate(coord_str):
-    """
-    Accepts DMS like 33° 52' 31.2" S or decimal with/without sign and optional NSEW.
-    Returns 'DD.ddddd X' or 'DD.ddddd' if direction cannot be inferred.
+# A hemisphere is information, and where the sample table does not record one it
+# must not be invented. Latitudes arrive as unsigned magnitudes -- a Ningaloo
+# sample at 22.03 S is stored as "22.03 113.891" -- and defaulting an unsigned
+# value to the northern hemisphere put fifteen Western Australian assemblies on
+# the wrong side of the equator. table2asn accepts the shape and then rejects the
+# value as SEQ_DESCR.LatLonValue because the coordinate contradicts the country,
+# which quarantines the whole assembly. So the hemisphere is only ever *read*
+# here; where the value carries none it is derived from the resolved
+# geo_loc_name, and where the country cannot settle it the modifier is omitted.
+# See format_lat_lon below.
+AXIS_HEMISPHERES = {"lat": ("N", "S"), "lon": ("E", "W")}
+
+def parse_coordinate(coord_str, axis):
+    """Parse one coordinate into (magnitude, hemisphere-or-None).
+
+    `axis` is "lat" or "lon" and fixes which hemisphere letters are legal, so a
+    longitude written "23.43 S" is rejected here rather than emitted as a second
+    latitude. Accepts DMS like 33° 52' 31.2" S and decimal with or without a sign
+    and with or without an NSEW letter.
+
+    Returns None when the text is not a coordinate for this axis at all. Returns
+    a None hemisphere when the value simply does not state one, which is a
+    different thing and is resolved against the country by the caller.
     """
     if coord_str is None:
         return None
+    positive, negative = AXIS_HEMISPHERES[axis]
     coord_str = _norm_quotes(coord_str)
-    direction = ""
+    hemisphere = None
 
     mdir = re.search(r"([NSEW])", coord_str, flags=re.IGNORECASE)
     if mdir:
-        direction = mdir.group(1).upper()
+        hemisphere = mdir.group(1).upper()
+        if hemisphere not in (positive, negative):
+            # A latitude labelled E, or a longitude labelled S. No correction is
+            # safe to guess, so this is not a coordinate.
+            return None
         coord_str = re.sub(r"[NSEW]", "", coord_str, flags=re.IGNORECASE).strip()
 
     mdms = re.match(r"(\d+(?:\.\d+)?)\s*[°:\s]\s*(\d+(?:\.\d+)?)\s*['\s]?\s*(\d+(?:\.\d+)?)?", coord_str)
@@ -102,20 +139,19 @@ def parse_coordinate(coord_str):
             dec = float(coord_str)
         except ValueError:
             return None
-        if not direction:
-            if -90 <= dec <= 90:
-                direction = "S" if dec < 0 else "N"
-            else:
-                direction = "W" if dec < 0 else "E"
+        if hemisphere is None and coord_str.strip().startswith(("-", "+")):
+            # An explicit sign IS a recorded hemisphere. Only a bare magnitude is
+            # silent, and only a bare magnitude falls through to the country.
+            hemisphere = negative if dec < 0 else positive
 
-    dec = abs(dec)
-    return f"{dec:.5f} {direction}" if direction else f"{dec:.5f}"
+    return abs(dec), hemisphere
 
-def smart_split_latlon(value):
+def split_lat_lon(value):
+    """Split a raw sample-table coordinate into its latitude and longitude text."""
     if value is None:
         return None, None
     value = _norm_quotes(value)
-    if value.lower() == "unknown":
+    if value == "" or value.lower() == "unknown":
         return None, None
 
     lat_match = re.search(r'([NS]?\s*[\d°\'"\.\-\s]+[NS])', value, re.IGNORECASE)
@@ -123,47 +159,179 @@ def smart_split_latlon(value):
     if lat_match and lon_match:
         return lat_match.group(1).strip(), lon_match.group(1).strip()
 
+    # A DMS pair carrying no hemisphere letters ("12° 34.5 113° 20.1"), which the
+    # whitespace split below would tear in half.
+    dms_parts = re.findall(r"\d+°\s*\d+(?:\.\d+)?", value)
+    if len(dms_parts) >= 2:
+        return dms_parts[0], dms_parts[1]
+
     parts = value.split()
     if len(parts) >= 2:
         return parts[0], parts[1]
     return None, None
 
-def fallback_parse_latlon(value):
-    if value is None:
-        return "unknown"
-    value = _norm_quotes(value)
-    if value.lower() == "unknown":
-        return "unknown"
+# ---------------------------
+# Source-modifier validation
+# ---------------------------
+# INSDC lat_lon: a latitude with a N/S hemisphere then a longitude with an E/W
+# hemisphere. Values that parse into something else (two latitudes, a missing
+# hemisphere, an out-of-range magnitude) reach table2asn as
+# SEQ_DESCR.LatLonFormat, and EMBOSS then demotes them to a stray /note on EMBL
+# conversion so ENA never sees a lat_lon at all. Catch them here instead.
+LATLON_RE = re.compile(r"^(\d+(?:\.\d+)?) ([NS]) (\d+(?:\.\d+)?) ([EW])$")
 
-    parts = re.findall(r"\d+°\s*\d+(?:\.\d+)?", value)
-    if len(parts) >= 2:
-        lat_dec = parse_coordinate(parts[0] + " S")
-        lon_dec = parse_coordinate(parts[1] + " E")
-        if lat_dec and lon_dec:
-            return f"{lat_dec} {lon_dec}"
+def valid_lat_lon(value):
+    """True when `value` is a well-formed INSDC lat_lon within coordinate range."""
+    match = LATLON_RE.match(str(value).strip())
+    if not match:
+        return False
+    lat, _lat_hem, lon, _lon_hem = match.groups()
+    return float(lat) <= 90.0 and float(lon) <= 180.0
 
-    split = value.split()
-    if len(split) >= 2:
-        lat_dec = parse_coordinate(split[0] + " S")
-        lon_dec = parse_coordinate(split[1] + " E")
-        if lat_dec and lon_dec:
-            return f"{lat_dec} {lon_dec}"
+def format_lat_lon(raw_value, geo_loc_name):
+    """Render a raw sample-table coordinate as an INSDC lat_lon.
 
-    return "unknown"
+    Returns (value, status). `value` is "" whenever nothing submittable can be
+    built, because an empty cell in the .src omits the modifier, and omission is
+    the only correct way to say "no value" here: the literal "unknown" is
+    rejected as SEQ_DESCR.LatLonFormat, and a guessed hemisphere is rejected as
+    SEQ_DESCR.LatLonValue. `status` is one of:
 
-def convert_full_latlon(raw_value):
-    lat_raw, lon_raw = smart_split_latlon(raw_value)
-    lat_dec = parse_coordinate(lat_raw) if lat_raw else None
-    lon_dec = parse_coordinate(lon_raw) if lon_raw else None
-    if lat_dec and lon_dec:
-        return f"{lat_dec} {lon_dec}"
-    return fallback_parse_latlon(raw_value)
+        'ok'            -- a complete, well-formed coordinate
+        'absent'        -- nothing recorded; the common case, reported silently
+        'unparsable'    -- text that is not a coordinate, or one out of range
+        'no_hemisphere' -- a bare magnitude the geo_loc_name cannot place,
+                           because the country straddles that axis or is not a
+                           mapped country at all
+        'conflict'      -- a stated hemisphere the geo_loc_name contradicts,
+                           which is precisely what table2asn rejects
+    """
+    lat_raw, lon_raw = split_lat_lon(raw_value)
+    if lat_raw is None and lon_raw is None:
+        return "", "absent"
+
+    lat = parse_coordinate(lat_raw, "lat")
+    lon = parse_coordinate(lon_raw, "lon")
+    if lat is None or lon is None:
+        return "", "unparsable"
+    lat_dec, lat_hem = lat
+    lon_dec, lon_hem = lon
+
+    country_lat_hem, country_lon_hem = hemispheres_for_geo_loc_name(geo_loc_name)
+
+    # A recorded hemisphere the country disagrees with is a bad record, not a
+    # value to correct: which of the two is wrong cannot be told from here.
+    for stated, implied in ((lat_hem, country_lat_hem), (lon_hem, country_lon_hem)):
+        if stated and implied and stated != implied:
+            return "", "conflict"
+
+    lat_hem = lat_hem or country_lat_hem
+    lon_hem = lon_hem or country_lon_hem
+    if not lat_hem or not lon_hem:
+        return "", "no_hemisphere"
+
+    formatted = f"{lat_dec:.5f} {lat_hem} {lon_dec:.5f} {lon_hem}"
+    return (formatted, "ok") if valid_lat_lon(formatted) else ("", "unparsable")
+
+# Operator-facing reason for each format_lat_lon status that drops a coordinate.
+# 'absent' is deliberately not here: most samples record no coordinate at all and
+# warning on every one of them would bury the rows that are actually broken.
+LATLON_DROP_REASONS = {
+    "unparsable": "is not a usable INSDC coordinate",
+    "no_hemisphere": ("records no hemisphere, and the geo_loc_name does not imply "
+                      "one (add the country to COUNTRY_HEMISPHERE in "
+                      "bin/geo_loc_name_utils.py, or sign the latitude at source)"),
+    "conflict": "states a hemisphere that its geo_loc_name contradicts",
+}
+
+# INSDC collection_date, in the three forms both gates accept: DD-Mmm-YYYY,
+# Mmm-YYYY and YYYY. Anything else is SEQ_DESCR.BadCollectionDate at table2asn,
+# which the validation gate counts as an ERROR and quarantines the assembly for.
+#
+# There is deliberately no missing-value term here. 'missing', 'not collected'
+# and 'not provided' all pass table2asn, so they look like the obvious fix, but
+# they belong to the ENA *sample checklist* vocabulary (ERC000011), not to the
+# flatfile qualifier: ENA's own CollectionDateQualifierCheck (sequencetools, the
+# validator ena-webin-cli runs) rejects every one of them. Adopting one would
+# just move the failure from the first gate to the last. collection_date is not
+# a required source qualifier in the ENA flatfile, so where no date is recorded
+# the cell is left empty and the modifier is simply omitted -- the same
+# resolution valid_lat_lon uses, and the only one that clears both gates.
+COLLECTION_DATE_RE = re.compile(
+    r"^(?:(?:\d{1,2}-)?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-)?\d{4}$"
+)
+
+def seqid_belongs_to(seqid, assembly_id):
+    """Is this database SeqID the one for `assembly_id`?
+
+    A SeqID is "<assembly prefix>.<annotation>", so an exact match or a match up to a
+    trailing dot. The dot is load-bearing: without it "getorg1770" also claims
+    "getorg1770reseed" and "getorg1770_rgj", and table2asn fatals when it is handed more
+    than one source qualifier file.
+    """
+    aid = str(assembly_id or "").strip()
+    if not aid:
+        return False
+    value = str(seqid or "").strip()
+    return value == aid or value.startswith(aid + ".")
+
+
+def no_seqid_match_message(assembly_id, seqids):
+    """Why no database SeqID matched, naming what the database did return.
+
+    Split out so the diagnosis is testable without pandas, and so the message always
+    lists the candidates -- seeing "getorg1770, getorg1770reseed, getorg1770_rgj" next to
+    a request for "getorg1770_concat" IS the diagnosis.
+    """
+    found = ", ".join(sorted({str(s).strip() for s in seqids if str(s).strip()})) or "(none)"
+    return (
+        f"❌ No mitogenome_data SeqID matches assembly-id '{assembly_id}'.\n"
+        f"   The database returned: {found}\n"
+        "   That means this assembly has no mitogenome_data row of its own. A curated\n"
+        "   variant (_concat, _rgj, _collapsed) only gets one if it was pushed under its\n"
+        "   own name. If this run used --skip_upload_results, or prep raced the pushes\n"
+        "   (submission prep no longer waits on the upload receipt), the row may simply\n"
+        "   not be committed yet."
+    )
+
+
+def valid_collection_date(value):
+    """True when `value` is a well-formed INSDC collection_date that is not in the future."""
+    text = str(value).strip()
+    if not COLLECTION_DATE_RE.match(text):
+        return False
+    # Both validators also reject a date later than today (table2asn:
+    # "Collection_date is in the future"; ENA: FutureDateException). The sample
+    # table carries day/month-transposed rows such as 2026-12-06 that parse
+    # cleanly but land in the future, so the format check alone is not enough.
+    for fmt in ("%d-%b-%Y", "%b-%Y", "%Y"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        return parsed.date() <= date.today()
+    return False
 
 # ---------------------------
 # DB query
 # ---------------------------
+def sequencing_relation(conn):
+    """The relation that carries sequencing runs with their og_id.
+
+    The v2 database schema removes og_id from `sequencing`; the `v_sequencing_browse`
+    view carries it, and becomes visible on the search_path at the v2 cutover. Use the
+    view when it is visible and the old table otherwise, so this works unchanged on
+    either side of the cutover.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('v_sequencing_browse') IS NOT NULL")
+        row = cur.fetchone()
+    return "v_sequencing_browse" if row and row[0] else "sequencing"
+
+
 def fetch_bankit_metadata(conn, og_id, tech):
-    query = """
+    relation = sequencing_relation(conn)
+    query = f"""
         WITH sequencing_info AS (
             SELECT
                 seq.og_id,
@@ -173,17 +341,29 @@ def fetch_bankit_metadata(conn, og_id, tech):
                     THEN SPLIT_PART(seq.sequencing_id, '_', 1)
                     ELSE NULL
                 END AS tissue_id
-            FROM sequencing seq
+            FROM {relation} seq
         )
         SELECT
+            -- CONCAT_WS + NULLIF, not CONCAT: a NULL/empty annotation column under CONCAT
+            -- produced "OG2936.ilmn.260909.getorg1770." -- a trailing dot that can never equal
+            -- the flat file's SeqID, so the assembly filter below silently matched nothing.
             STRING_AGG(
-                DISTINCT CONCAT(m.og_id, '.', m.tech, '.', m.seq_date, '.', m.code, '.', m.annotation),
+                DISTINCT CONCAT_WS('.', m.og_id, m.tech, m.seq_date, m.code, NULLIF(m.annotation, '')),
                 ', '
             ) AS "SeqID",
             s.og_id AS isolate,
             COALESCE(t.tissue, 'Unknown') AS tissue_type,
             CASE
-                WHEN s.country IS NULL THEN 'Unknown'
+                -- A NULL country used to collapse straight to 'Unknown', discarding
+                -- any locality recorded alongside it. Some rows carry no country but
+                -- a locality that names one ('Israel, Elat, Gulf of Aquaba'), so pass
+                -- the locality through and let resolve_geo_loc_name promote its
+                -- leading token when that token is a controlled value.
+                WHEN s.country IS NULL OR s.country = '' THEN
+                    CASE
+                        WHEN s.location IS NULL OR s.location = '' THEN 'Unknown'
+                        ELSE s.location
+                    END
                 WHEN s.state IS NULL OR s.state = '' THEN
                     CASE
                         WHEN s.location IS NULL OR s.location = '' THEN s.country
@@ -224,15 +404,33 @@ def main():
         df = fetch_bankit_metadata(conn, args.og_id, args.seq_tech)
 
     if df.empty:
-        print(f"❌ No metadata found for sample {args.og_id} with tech {args.seq_tech}")
-        pd.DataFrame().to_csv(f"{args.og_id}.bankit_metadata.csv", index=False)
-        pd.DataFrame().to_csv(f"{args.og_id}.bankit_metadata_latlon_cleaned.csv", index=False)
-        return
+        # Fail rather than write empty tables. The query SELECTs only from sample,
+        # but it INNER-filters on mitogenome_data (WHERE m.og_id / m.tech), so an
+        # empty result almost always means the mitogenome_data parent row does not
+        # exist yet -- not that the specimen has no collection metadata.
+        #
+        # This used to write two empty CSVs and exit 0, which produced a package
+        # with no source modifiers at all and said so only in the task log. That
+        # was survivable while submission prep was gated behind the committed
+        # upload receipt and the row was therefore guaranteed. Prep now runs with
+        # --skip_upload_results, where a sample new to the database genuinely has
+        # no row, and a silent empty .src there would reach a submitter looking
+        # exactly like a specimen with nothing recorded about it.
+        raise SystemExit(
+            f"❌ No metadata found for {args.og_id} (tech: {args.seq_tech}). "
+            "The mitogenome_data row this query filters on is missing, or the "
+            "specimen has no sample record. Upload the assembly results first "
+            "(run without --skip_upload_results), or fix the sample record."
+        )
 
     # Format dates
     df["Collection_date"] = pd.to_datetime(df["date_collected"], errors="coerce")
     df["Collection_date"] = df["Collection_date"].dt.strftime("%d-%b-%Y")
-    df["Collection_date"] = df["Collection_date"].fillna("Unknown")
+    # An unrecorded date leaves the cell empty, which omits the modifier. It used
+    # to be filled with the literal "Unknown", which table2asn rejects outright as
+    # SEQ_DESCR.BadCollectionDate -- see valid_collection_date above for why no
+    # missing-value term is substituted instead.
+    df["Collection_date"] = df["Collection_date"].fillna("")
     df = df.drop(columns=["date_collected"])
 
     # Write raw metadata
@@ -240,10 +438,36 @@ def main():
     df.to_csv(out_csv, index=False)
     print(f"📁 Metadata written to: {out_csv}")
 
+    # geo_loc_name (the 'country' modifier) must start with a value from the INSDC
+    # controlled list, and it is one of only two mandatory fields in ENA checklist
+    # ERC000011. The sample table is rebuilt from a spreadsheet, so typos and
+    # long-form names ("Kingdom of Tonga", "Austalia") are translated here rather
+    # than corrected upstream, where the next refresh would undo the fix.
+    # Where the row records no country, a BioSample this project already registered
+    # for the same og_id may state one; failing that the INSDC 'not provided' term
+    # is written, because geo_loc_name is mandatory and omitting it fails sample
+    # registration outright.
+    #
+    # Resolved before the coordinate below, and not after it as it once was,
+    # because a latitude the sample table records without a hemisphere can only
+    # be placed against the country -- and only against the canonical spelling of
+    # it, so that the alias table is the single place country names are corrected.
+    _resolved = [
+        resolve_geo_loc_name(_country, _og_id)
+        for _country, _og_id in zip(df["country"], df["isolate"])
+    ]
+    df["country"] = [value for value, _status in _resolved]
+    df["_geo_loc_status"] = [status for _value, status in _resolved]
+
     # Lat/Lon cleanup + write cleaned
-    df["formatted_lat_lon"] = df["lat_lon"].apply(convert_full_latlon)
+    _formatted = [
+        format_lat_lon(_raw, _country)
+        for _raw, _country in zip(df["lat_lon"], df["country"])
+    ]
+    df["formatted_lat_lon"] = [value for value, _status in _formatted]
+    df["_lat_lon_status"] = [status for _value, status in _formatted]
     cleaned_csv = f"{args.og_id}.bankit_metadata_latlon_cleaned.csv"
-    df.to_csv(cleaned_csv, index=False)
+    df.drop(columns=["_geo_loc_status", "_lat_lon_status"]).to_csv(cleaned_csv, index=False)
     print(f"✅ Updated metadata with cleaned lat/lon values: {cleaned_csv}")
 
     # Expand SeqIDs and write .src files into the working directory
@@ -252,20 +476,92 @@ def main():
     df_exp = df_exp.explode("SeqID")
     df_exp["SeqID"] = df_exp["SeqID"].str.strip()
 
-    # ensure lat/lon always has a value
-    df_exp["formatted_lat_lon"] = df_exp["lat_lon"].apply(convert_full_latlon)
-    df_exp["formatted_lat_lon"] = df_exp["formatted_lat_lon"].fillna("unknown")
+    # Keep only the SeqID for the assembly actually being processed. The SQL
+    # STRING_AGG returns every assembly variant for this og_id+tech (e.g. both
+    # getorg1770 and getorg1770reseed), but table2asn submits one assembly and
+    # must receive exactly one .src; staging several trips a "source qualifier
+    # file does not exist" fatal. Match on the assembly prefix passed in (the
+    # SeqID is "<assembly-id>.<annotation>", so require a trailing dot so that
+    # getorg1770 does not also match getorg1770reseed).
+    #
+    # No match is now FATAL. It used to print a warning and write every sibling
+    # variant's .src unfiltered, then exit 0 -- so a _concat assembly produced
+    # OG2936.ilmn.260909.getorg1770..src and ...getorg1770_rgj.mitos2110.src, none of
+    # which matched the module's output glob. The task therefore "succeeded" with no
+    # output and the sample was dropped by the inner join in ena_submission_prep,
+    # reported only as a held row blaming a task failure that never happened.
+    # Writing files under other assemblies' names is never the right answer.
+    _aid = (args.assembly_id or "").strip()
+    if _aid:
+        _match = df_exp["SeqID"].apply(lambda value: seqid_belongs_to(value, _aid))
+        if not _match.any():
+            raise SystemExit(no_seqid_match_message(_aid, list(df_exp["SeqID"])))
+        df_exp = df_exp[_match].copy()
 
-    for _, row in df_exp.iterrows():
-        full_seqid = row["SeqID"]
-        src_path = os.path.join(".", f"{full_seqid}.src")
-        with open(src_path, "w") as f:
-            f.write("SeqID\tisolate\ttissue_type\tcountry\tlat_lon\tCollection_date\n")
-            f.write(
-                f"{full_seqid}\t{row['isolate']}\t{row['tissue_type']}\t"
-                f"{row['country']}\t{row['formatted_lat_lon']}\t{row['Collection_date']}\n"
-            )
-        print(f"✅ Wrote: {src_path}")
+    # A coordinate that cannot be turned into a submittable INSDC lat_lon is
+    # dropped rather than guessed at, and the reason is named so the source record
+    # can be fixed. Emitting a bad one is worse than emitting none: table2asn
+    # flags it and EMBOSS then demotes it to a note, so the wrong value reaches
+    # ENA disguised as free text. Warned per SeqID here, after the assembly filter
+    # above, so the message names the assembly actually being submitted.
+    for _seqid, _raw, _status in zip(
+        df_exp["SeqID"], df_exp["lat_lon"], df_exp["_lat_lon_status"]
+    ):
+        if _status in LATLON_DROP_REASONS:
+            print(f"⚠️  {_seqid}: lat_lon '{_raw}' {LATLON_DROP_REASONS[_status]}; "
+                  f"omitting the modifier. Fix the source record.", flush=True)
+
+    # Same treatment for a date that is present but not submittable -- a future
+    # date, or anything that is not one of the three INSDC forms. Unlike
+    # geo_loc_name this is not mandatory anywhere on the ENA flatfile route, so an
+    # omitted date costs nothing, whereas a bad one fails the gate for the whole
+    # assembly. Most samples reaching here simply have no date recorded at all;
+    # that is already an empty cell and is passed over silently rather than
+    # warned about on every record.
+    df_exp["Collection_date"] = df_exp["Collection_date"].fillna("").astype(str).str.strip()
+    _bad_date = df_exp["Collection_date"].ne("") & ~df_exp["Collection_date"].apply(valid_collection_date)
+    for _seqid, _value in zip(df_exp.loc[_bad_date, "SeqID"], df_exp.loc[_bad_date, "Collection_date"]):
+        print(f"⚠️  {_seqid}: Collection_date '{_value}' is not a submittable INSDC "
+              f"date; omitting the modifier. Fix the source record.", flush=True)
+    df_exp.loc[_bad_date, "Collection_date"] = ""
+
+    # An unmapped country is left untouched on purpose: table2asn then raises
+    # SEQ_DESCR.BadGeoLocNameCode and the validation gate quarantines this one
+    # assembly, which is safer than substituting a placeholder and silently
+    # replacing the recorded locality. Resolution itself happened before the
+    # coordinate block above; only the reporting waits until here, so each message
+    # names the assembly being submitted rather than the aggregated row.
+    for _seqid, _value, _status in zip(
+        df_exp["SeqID"], df_exp["country"], df_exp["_geo_loc_status"]
+    ):
+        if _status == "unmapped":
+            print(unmapped_warning(_seqid, _value), flush=True)
+        elif _status == "derived":
+            # An inference from the locality text rather than a recorded country,
+            # so say so: it is the one value here that was not asserted by the DB.
+            print(f"ℹ️  {_seqid}: no country recorded; derived geo_loc_name "
+                  f"{_value!r} from the locality.", flush=True)
+        elif _status == "biosample":
+            print(f"ℹ️  {_seqid}: no country recorded; recovered geo_loc_name "
+                  f"{_value!r} from the registered NCBI BioSample.", flush=True)
+
+    # Exactly one .src, named from --full-seqid rather than from the database.
+    #
+    # Every other column this query returns is per-SPECIMEN; only the STRING_AGG SeqID is
+    # per-assembly, and that value is one the pipeline already holds in meta.full_seqid. Taking
+    # the name from the DB meant a malformed or stale SeqID produced a correctly-shaped file
+    # under a name nothing downstream looks for. The filter above has already proved a row for
+    # this assembly exists; the name now comes from the caller.
+    full_seqid = args.full_seqid.strip()
+    row = df_exp.iloc[0]
+    src_path = os.path.join(".", f"{full_seqid}.src")
+    with open(src_path, "w") as f:
+        f.write("SeqID\tisolate\ttissue_type\tcountry\tlat_lon\tCollection_date\n")
+        f.write(
+            f"{full_seqid}\t{row['isolate']}\t{row['tissue_type']}\t"
+            f"{row['country']}\t{row['formatted_lat_lon']}\t{row['Collection_date']}\n"
+        )
+    print(f"✅ Wrote: {src_path}")
 
 if __name__ == "__main__":
     main()

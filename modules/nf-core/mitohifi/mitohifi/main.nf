@@ -4,7 +4,7 @@ process MITOHIFI_MITOHIFI {
     errorStrategy { task.attempt <= 2 ? 'retry' : 'ignore' }
     maxRetries 2
 
-    container 'ghcr.io/marcelauliano/mitohifi:master'
+    container "${params.mitohifi_container}"   // pinned in nextflow.config (single source of truth)
 
     input:
     tuple val(meta), path(hifi_cat), path(ref_fa), path(ref_gb)
@@ -31,6 +31,7 @@ process MITOHIFI_MITOHIFI {
     tuple val(meta), path("MitoReference")                  , emit: reference_files            , optional: true
     tuple val(meta), path("${meta.mt_assembly_prefix}.hifiasm.log"), emit: logs 
     tuple val(meta), path("${meta.mt_assembly_prefix}.log"), emit: command_logs 
+    tuple val(meta), path("05_mitohifi.tool_params_mqcrow.html"), emit: tool_params
     path  "versions.yml"                                    , emit: versions
   
     when:
@@ -39,6 +40,10 @@ process MITOHIFI_MITOHIFI {
     script:
     def args = task.ext.args ?: ''
     def prefix = task.ext.prefix ?: "${meta.mt_assembly_prefix}"
+    // Prefer the per-sample mitochondrial code derived from taxonomic class
+    // (e.g. Cnidaria -> 4); fall back to the workflow-level mito_code value.
+    def code = meta.genetic_code ?: mito_code
+    def effective_args = ["-${input_mode} ${hifi_cat}", "-f ${ref_fa}", "-g ${ref_gb}", "-t ${task.cpus}", args, "-o ${code}"].findAll { it?.toString()?.trim() }.join(' ')
     if (! ["c", "r"].contains(input_mode)) {
         error "r for reads or c for contigs must be specified"
     }
@@ -52,37 +57,49 @@ process MITOHIFI_MITOHIFI {
         -f ${ref_fa} \\
         -g ${ref_gb} \\
         -t $task.cpus ${args} \\
-        -o ${mito_code}
+        -o ${code}
+
+    cat <<-END_TOOL_PARAMS > 05_mitohifi.tool_params_mqcrow.html
+    <tr><td>MitoHiFi</td><td><samp>${effective_args}</samp></td><td>Runs MitoHiFi in ${input_mode == 'r' ? 'read' : 'contig'} mode for ${meta.id} with mitochondrial code ${code}.</td></tr>
+    END_TOOL_PARAMS
 
     exit_code=\$?
 
-    # Rename files
-    mv final_mitogenome.fasta ${prefix}.fasta
-    mv final_mitogenome.gb ${prefix}.gb
-    mv reads_mapping_and_assembly/hifiasm.log ${prefix}.hifiasm.log
-    mv .command.log ${prefix}.log
-    mv contigs_stats.tsv ${prefix}.contigs_stats.tsv
+    # Rename files. MitoHiFi may finish without producing a final assembly
+    # (e.g. when no contig passes filtering); in that case keep going and emit
+    # an empty placeholder so downstream stages can detect "failed to assemble"
+    # instead of crashing on the missing output.
+    mv final_mitogenome.fasta ${prefix}.fasta 2>/dev/null || touch ${prefix}.fasta
+    mv final_mitogenome.gb ${prefix}.gb 2>/dev/null || true
+    mv reads_mapping_and_assembly/hifiasm.log ${prefix}.hifiasm.log 2>/dev/null || touch ${prefix}.hifiasm.log
+    mv .command.log ${prefix}.log 2>/dev/null || touch ${prefix}.log
+    mv contigs_stats.tsv ${prefix}.contigs_stats.tsv 2>/dev/null || touch ${prefix}.contigs_stats.tsv
 
     mkdir -p MitoReference
     cp $ref_fa $ref_gb MitoReference/
     # Check if the main output was created and rename the fasta header to include the mt_assembly_prefix
-    if [ -f "${prefix}.fasta" ]; then
+    if [ -s "${prefix}.fasta" ]; then
         sed -i "/^>/s/.*/>${prefix}/g" ${prefix}.fasta
     fi
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
-        mitohifi: \$( mitohifi.py --version 2>&1 | head -n1 | sed 's/^.*MitoHiFi //; s/ .*\$//' )
+        mitohifi: ${params.mitohifi_container.tokenize(':').last()}
     END_VERSIONS
     """
 
     stub:
     def prefix = task.ext.prefix ?: "${meta.mt_assembly_prefix}"
+    def args = task.ext.args ?: ''
+    def code = meta.genetic_code ?: mito_code
+    def effective_args = ["-${input_mode} ${hifi_cat}", "-f ${ref_fa}", "-g ${ref_gb}", "-t ${task.cpus}", args, "-o ${code}"].findAll { it?.toString()?.trim() }.join(' ')
     """
     # Create all expected output files for testing
     touch ${prefix}.fasta
     touch ${prefix}.gb
     touch ${prefix}.contigs_stats.tsv
+    touch ${prefix}.hifiasm.log
+    touch ${prefix}.log
     touch all_potential_contigs.fa
     touch contigs_annotations.png
     touch coverage_plot.png
@@ -97,9 +114,13 @@ process MITOHIFI_MITOHIFI {
     mkdir potential_contigs
     mkdir reads_mapping_and_assembly
 
+    cat <<-END_TOOL_PARAMS > 05_mitohifi.tool_params_mqcrow.html
+    <tr><td>MitoHiFi</td><td><samp>${effective_args}</samp></td><td>Runs MitoHiFi in ${input_mode == 'r' ? 'read' : 'contig'} mode for ${meta.id} with mitochondrial code ${code}.</td></tr>
+    END_TOOL_PARAMS
+
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
-        mitohifi: \$( mitohifi.py --version 2>&1 | head -n1 | sed 's/^.*MitoHiFi //; s/ .*\$//')
+        mitohifi: ${params.mitohifi_container.tokenize(':').last()}
     END_VERSIONS
     """
 }

@@ -1,0 +1,129 @@
+nextflow_workflow {
+    name "Reference lookup outcomes remain cohort-safe"
+    script "./main.nf"
+    config "./nextflow.config"
+    workflow "REFERENCE_POLICY"
+
+    test("successful lookup emits found") {
+        when {
+            workflow {
+                """
+                input[0] = Channel.value([id: 'success', species_id: 'success', nominal_species_id: 'success', mt_assembly_prefix: 'success'])
+                """
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.succeeded().size() == 1 },
+                { assert workflow.out.status[0][1].text.contains('\tfound\t0\t') }
+            )
+        }
+    }
+
+    test("zero exit without files emits no_reference") {
+        when {
+            workflow {
+                """
+                input[0] = Channel.value([id: 'no_reference', species_id: 'no_reference', nominal_species_id: 'no_reference', mt_assembly_prefix: 'no_reference'])
+                """
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.out.status[0][1].text.contains('\tno_reference\t0\t') },
+                { assert workflow.out.reference[0][1].size() == 0 },
+                { assert workflow.out.reference[0][2].size() == 0 }
+            )
+        }
+    }
+
+    test("transient lookup retries and succeeds") {
+        when {
+            workflow {
+                """
+                input[0] = Channel.value([id: 'transient_then_success', species_id: 'transient_then_success', nominal_species_id: 'transient_then_success', mt_assembly_prefix: 'transient_then_success'])
+                """
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.failed().size() == 1 },
+                { assert workflow.out.status[0][1].text.contains('\tfound\t0\t') }
+            )
+        }
+    }
+
+    test("exhausted lookup emits lookup_error on fourth attempt") {
+        when {
+            workflow {
+                """
+                input[0] = Channel.value([id: 'exhausted', species_id: 'exhausted', nominal_species_id: 'exhausted', mt_assembly_prefix: 'exhausted'])
+                """
+            }
+        }
+        then {
+            assertAll(
+                { assert workflow.success },
+                { assert workflow.trace.failed().size() == 3 },
+                { assert workflow.trace.succeeded().size() == 1 },
+                { assert workflow.out.status[0][1].text.contains('\tlookup_error\t137\t') }
+            )
+        }
+    }
+}
+
+nextflow_workflow {
+    name "Canonical upload selection"
+    script "./main.nf"
+    config "./nextflow.config"
+    workflow "UPLOAD_SELECTION"
+
+    test("the winning variant is excluded and every superseded attempt keeps its own name") {
+        when {
+            workflow {
+                """
+                // Three GetOrganelle variants for one sample. Every row carries the same
+                // LINEAGE key (mt_assembly_run_prefix); each variant's own identity is the
+                // tuple key, which is its FASTA basename. The checked -- i.e. winning --
+                // variant here is the _rgj one.
+                input[0] = Channel.of(
+                    ['OG1.getorg1770',           [id: 'OG1', mt_assembly_run_prefix: 'OG1.getorg1770'], 'raw-first.fa',  'first.log'],
+                    ['OG1.getorg1770reseed',     [id: 'OG1', mt_assembly_run_prefix: 'OG1.getorg1770'], 'raw-reseed.fa', 'reseed.log'],
+                    ['OG1.getorg1770reseed_rgj', [id: 'OG1', mt_assembly_run_prefix: 'OG1.getorg1770'], 'raw-rgj.fa',    'rgj.log']
+                )
+                input[1] = Channel.of(
+                    ['OG1.getorg1770', 'OG1.getorg1770reseed_rgj', true]
+                )
+                """
+            }
+        }
+        then {
+            def results = workflow.out.results.collect { it instanceof String ? evaluate(it) : it }
+            assertAll(
+                { assert workflow.success },
+                // The WINNER is dropped: the parent workflow already emits it as the sample's
+                // canonical row, under this same identity. Emitting it here too would put a
+                // duplicate into mtdna_assembly, which is what the removed groupTuple used to
+                // prevent at the cost of a whole-run barrier.
+                { assert results.size() == 2 },
+                { assert !results.any { it[0].mt_assembly_prefix == 'OG1.getorg1770reseed_rgj' } },
+                // Every superseded attempt survives, each exactly once, under its OWN name and
+                // with its own FASTA. The first pass is provenance now, not a duplicate: the
+                // canonical row no longer borrows its name.
+                { assert results.count { it[0].mt_assembly_prefix == 'OG1.getorg1770' } == 1 },
+                { assert results.find { it[0].mt_assembly_prefix == 'OG1.getorg1770' }[1] == 'raw-first.fa' },
+                { assert results.count { it[0].mt_assembly_prefix == 'OG1.getorg1770reseed' } == 1 },
+                { assert results.find { it[0].mt_assembly_prefix == 'OG1.getorg1770reseed' }[1] == 'raw-reseed.fa' },
+                // No superseded attempt takes the corrected circular verdict: that verdict
+                // describes the molecule that was checked, which is none of these. Each falls
+                // back to its own GetOrganelle log topology in the DB push.
+                { assert results.every { it[0].circular == null } },
+                // The lineage key is never rewritten -- only the identity moves.
+                { assert results.every { it[0].mt_assembly_run_prefix == 'OG1.getorg1770' } }
+            )
+        }
+    }
+}

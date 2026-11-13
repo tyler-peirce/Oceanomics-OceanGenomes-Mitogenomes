@@ -11,17 +11,32 @@ process EXTRACT_GENES_GFF {
 
     output:
     tuple val(meta), path('genes'), emit: genes_dir
+    // The concatenated gene FASTA on its own: the ENA candidate package carries it
+    // alongside the sequence and annotation, and staging the whole genes/ directory
+    // there would drag in the per-CDS singles too.
+    tuple val(meta), path('genes/*.genes.fa'), emit: genes_fa
+    tuple val(meta), path("17_extract_genes_gff.tool_params_mqcrow.html"), emit: tool_params
     path "versions.yml"                                                , emit: versions
 
     script:
     def asm = (meta.mt_assembly_prefix ?: meta.sample_id ?: fasta.baseName)
+    // Per-sample mitochondrial translation table, same idiom as GEN_FILES_TABLE2ASN
+    // and FORMAT_FILES. It becomes the [mgcode=] tag on every extracted gene header,
+    // so it has to match the genome FASTA and table2asn rather than assume code 2.
+    def gcode = task.ext.code ?: meta.genetic_code
+    def effective_args = "--fasta ${fasta} --gff ${gff} --outdir . --assembly ${asm} --genetic-code ${gcode}"
 
     """
     extract_genes_gff.py \\
         --fasta ${fasta} \\
         --gff ${gff} \\
         --outdir . \\
-        --assembly ${asm}
+        --assembly ${asm} \\
+        --genetic-code ${gcode}
+
+    cat <<-END_TOOL_PARAMS > 17_extract_genes_gff.tool_params_mqcrow.html
+    <tr><td>Extract Genes GFF</td><td><samp>${effective_args}</samp></td><td>Extracts gene sequences from GFF annotation for ${meta.id}.</td></tr>
+    END_TOOL_PARAMS
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
@@ -30,8 +45,15 @@ process EXTRACT_GENES_GFF {
     """
 
     stub:
+    def asm = (meta.mt_assembly_prefix ?: meta.sample_id ?: fasta.baseName)
+    def gcode = task.ext.code ?: meta.genetic_code ?: params.translation_table ?: 2
+    def effective_args = "--fasta ${fasta} --gff ${gff} --outdir . --assembly ${asm} --genetic-code ${gcode}"
     """
     mkdir -p genes
+    touch genes/${asm}.genes.fa
+    cat <<-END_TOOL_PARAMS > 17_extract_genes_gff.tool_params_mqcrow.html
+    <tr><td>Extract Genes GFF</td><td><samp>${effective_args}</samp></td><td>Extracts gene sequences from GFF annotation for ${meta.id}.</td></tr>
+    END_TOOL_PARAMS
     : > versions.yml
     """
 }
